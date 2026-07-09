@@ -71,8 +71,23 @@ class Stats:
 class Store:
     """Facade over one or more source adapters."""
 
-    def __init__(self, sources: list[Source] | None = None) -> None:
+    def __init__(
+        self, sources: list[Source] | None = None, *, live_probe=None,
+        hide_archived_only=False,
+    ) -> None:
         self._sources = sources if sources is not None else registry.available_sources()
+        # Optional authoritative set of live `(source, id)` keys, used ONLY to
+        # decide whether an archived session is "deleted" (archived_only) vs.
+        # still live. Needed for the archive-only store (which has no live
+        # sources of its own), so a still-live session is not mislabelled
+        # "deleted". `None` means "infer from this store's own live sources".
+        self._live_probe = live_probe
+        # When True, drop archived-only (deleted-from-agent) sessions from
+        # listings. Used by "live" mode, which composes with the archive purely
+        # to ANNOTATE live sessions with their archive status (archived / stale)
+        # -- so the provenance tag matches the other modes -- without surfacing
+        # sessions the agent has deleted.
+        self._hide_archived_only = hide_archived_only
 
     @property
     def sources(self) -> list[Source]:
@@ -87,7 +102,44 @@ class Store:
         """
         wanted = set(names)
         chosen = [s for s in self._sources if s.name in wanted]
-        return Store(chosen)
+        return Store(chosen, live_probe=self._live_probe,
+                     hide_archived_only=self._hide_archived_only)
+
+    def with_archive(self, vault_path, *, live_probe=None, hide_archived_only=False) -> "Store":
+        """Return a Store that also reads a durable archive vault.
+
+        The archive source is appended AFTER the live sources so that
+        first-match resolution and (source, id) dedup both favour the fresher
+        live copy (see `docs/archive-plan.md` §7.2). A session that exists only
+        in the vault -- deleted from its agent -- still surfaces, carrying the
+        ``archived_only`` badge. No-op if the vault does not exist.
+
+        `live_probe`: an authoritative set of live `(source, id)` keys for the
+        deleted-vs-live decision. Supply this when the resulting store has no
+        live sources of its own (the archive-only "browse the vault" store), so
+        a still-live session is labelled "archived", not "deleted".
+        """
+        from .sources.archive import ArchiveSource
+
+        arc = ArchiveSource(vault_path)
+        if not arc.is_available():
+            return self
+        return Store([*self._sources, arc],
+                     live_probe=live_probe if live_probe is not None else self._live_probe,
+                     hide_archived_only=hide_archived_only or self._hide_archived_only)
+
+    def live_keys(self) -> set:
+        """The set of `(source, id)` keys held by this store's LIVE (non-archive)
+        sources -- used as a `live_probe` for an archive-only store."""
+        from .sources.archive import ArchiveSource
+
+        keys = set()
+        for src in self._sources:
+            if isinstance(src, ArchiveSource):
+                continue
+            for s in src.list_sessions():
+                keys.add((s.source, s.id))
+        return keys
 
     # -- aggregate stats ----------------------------------------------------
 
@@ -193,6 +245,7 @@ class Store:
     def list_sessions(
         self,
         *,
+        source: str | None = None,
         directory: str | None = None,
         query: str | None = None,
         since: datetime | None = None,
@@ -204,6 +257,10 @@ class Store:
         """List sessions across sources, newest first.
 
         Args:
+          source: keep only sessions whose ORIGINAL source matches (filters on
+            `sess.source`, not the adapter name -- so an archived opencode
+            session is kept when `source="opencode"`, even though its holding
+            adapter is the archive reader).
           directory: keep only sessions whose directory contains this substring.
           query: case-insensitive substring match on the title.
           since / until: keep sessions whose updated (or created) time falls
@@ -215,6 +272,8 @@ class Store:
         results: list[Session] = []
         for src in self._sources:
             for sess in src.list_sessions():
+                if source and sess.source != source:
+                    continue
                 if directory and (sess.directory is None or directory not in sess.directory):
                     continue
                 if query and query.lower() not in (sess.title or "").lower():
@@ -225,6 +284,11 @@ class Store:
                 if until and (when is None or when > until):
                     continue
                 results.append(sess)
+        results = _dedup(results, live_probe=self._live_probe)
+        if self._hide_archived_only:
+            # "live" mode: keep the archive annotation on live sessions but drop
+            # sessions that exist ONLY in the vault (deleted from their agent).
+            results = [s for s in results if not (s.raw or {}).get("archived_only")]
         results.sort(key=_sort_key, reverse=True)
 
         if fold_subagents:
@@ -239,21 +303,87 @@ class Store:
     # -- single session -----------------------------------------------------
 
     def _resolve(self, selector: str, source: str | None):
-        """Return (Source, full_id) for a selector, or (None, None)."""
+        """Return (Source, full_id) for a selector, or (None, None).
+
+        When a `source` qualifier is given it selects by adapter name, but the
+        injected archive reader is ALWAYS kept as a trailing fallback: an
+        archived session keeps its ORIGINAL source name (e.g. "opencode"),
+        which never equals the archive adapter's own name, so a `source=`
+        filter would otherwise make deleted-but-archived sessions unresolvable.
+        Ordering (live first, archive last) still makes live win.
+        """
+        from .sources.archive import ArchiveSource
+
         src_name, sel = _split_selector(selector, source)
-        candidates = self._sources if src_name is None else [
-            s for s in self._sources if s.name == src_name
-        ]
+        if src_name is None:
+            candidates = self._sources
+        else:
+            candidates = [
+                s for s in self._sources
+                if s.name == src_name or isinstance(s, ArchiveSource)
+            ]
         for src in candidates:
             full = src.resolve_session_id(sel)
             if full:
                 return src, full
         return None, None
 
+    def _archive_reader(self):
+        """The injected ArchiveSource, if any (None when no vault is attached)."""
+        from .sources.archive import ArchiveSource
+
+        return next((s for s in self._sources if isinstance(s, ArchiveSource)), None)
+
+    def _mark_archived_only(self, sess: Session | None, src) -> Session | None:
+        """Tag a single-session load with archive provenance + status.
+
+        The list path computes `archived` / `archived_only` / `archive_status`
+        via `_dedup`; single-session loads bypass dedup, so this recomputes the
+        same facts for a consistent badge + a working per-session sync button:
+
+        * resolved from the vault, no live twin -> archived_only + status
+          "archived";
+        * resolved from a live source with a vault twin -> "archived" (up to
+          date) or "stale" (signatures differ);
+        * no vault copy -> status "none".
+        """
+        from dataclasses import replace
+
+        from .sources.archive import ArchiveSource
+
+        if sess is None:
+            return sess
+
+        def _sig(s):
+            return (s.updated.isoformat() if s.updated else None, s.message_count)
+
+        arc = self._archive_reader()
+
+        if isinstance(src, ArchiveSource):
+            live_has = any(
+                not isinstance(s, ArchiveSource) and s.resolve_session_id(sess.id)
+                for s in self._sources
+            )
+            raw = {**(sess.raw or {}), "archived": True}
+            if not live_has:
+                raw["archived_only"] = True
+                raw["archive_status"] = "archived"
+            return replace(sess, raw=raw)
+
+        # Resolved from a live source: consult the vault reader for a twin.
+        if arc is not None:
+            twin = arc.load_session(sess.id)
+            if twin is not None and twin.source == sess.source:
+                status = "archived" if _sig(twin) == _sig(sess) else "stale"
+                return replace(sess, raw={
+                    **(sess.raw or {}), "archived": True, "archive_status": status,
+                })
+        return replace(sess, raw={**(sess.raw or {}), "archive_status": "none"})
+
     def load_session_meta(self, selector: str, *, source: str | None = None) -> Session | None:
         """Load only a session's metadata (no messages) -- cheap for huge ones."""
         src, full = self._resolve(selector, source)
-        return src.load_session_meta(full) if src else None
+        return self._mark_archived_only(src.load_session_meta(full), src) if src else None
 
     def load_messages(
         self, selector: str, *, source: str | None = None,
@@ -269,7 +399,7 @@ class Store:
         Selector may be `source:id`, a full id, a unique prefix, or 'latest'.
         """
         src, full = self._resolve(selector, source)
-        return src.load_session(full) if src else None
+        return self._mark_archived_only(src.load_session(full), src) if src else None
 
     # -- search -------------------------------------------------------------
 
@@ -368,10 +498,10 @@ class Store:
         ql = query.lower()
         count = 0
         for meta in self.list_sessions(directory=directory, since=since, until=until):
-            src = next((s for s in self._sources if s.name == meta.source), None)
-            if src is None:
-                continue
-            sess = src.load_session(meta.id)
+            # Route via the resolver so archive-only sessions (whose holding
+            # adapter's name differs from their original source) are found too,
+            # and so the loaded session carries the archived_only badge.
+            sess = self.load_session(meta.id, source=meta.source)
             if sess is None:
                 continue
             for msg in sess.messages:
@@ -390,6 +520,75 @@ class Store:
                     count += 1
                     if limit is not None and count >= limit:
                         return
+
+
+def _dedup(sessions: list[Session], *, live_probe=None) -> list[Session]:
+    """Collapse duplicate `(source, id)` sessions, keeping the first seen.
+
+    Sources are gathered live-first with any injected `ArchiveSource` last
+    (see `Store.with_archive`), so "first wins" means the fresher live copy
+    shadows its archived twin -- the resolved precedence in
+    `docs/archive-plan.md` §7.2. This is the single dedup chokepoint: `stats`,
+    the lexical search filter, and the indexed search filter all funnel
+    through `list_sessions`, so guarding here prevents the double-counting
+    hazard those paths would otherwise have.
+
+    Badge facts surfaced on the surviving copy's `raw`:
+
+    * ``archived`` -- a copy of this session exists in the vault (true whether
+      the survivor is the live copy or the archive copy).
+    * ``archived_only`` -- the session exists ONLY in the vault, i.e. it was
+      deleted from its agent (the survivor is the archive copy, with no live
+      twin).
+    * ``archive_status`` -- ``"none"`` (no vault copy), ``"archived"`` (vault
+      copy is up to date), or ``"stale"`` (a live copy exists AND the vault
+      copy is out of date -- fewer messages / older `updated`). Drives the
+      per-session "archive / update" button in the web UI.
+    """
+    from dataclasses import replace
+
+    def _sig(s: Session):
+        return (s.updated.isoformat() if s.updated else None, s.message_count)
+
+    seen: dict[tuple[str, str], Session] = {}
+    order: list[tuple[str, str]] = []
+    archived_sig: dict[tuple[str, str], tuple] = {}
+    for s in sessions:
+        key = (s.source, s.id)
+        if (s.raw or {}).get("archived"):
+            archived_sig[key] = _sig(s)
+        if key not in seen:
+            seen[key] = s  # first wins: live shadows archive (ordering)
+            order.append(key)
+
+    out: list[Session] = []
+    for key in order:
+        s = seen[key]
+        survivor_is_archive = bool((s.raw or {}).get("archived"))
+        if key not in archived_sig:
+            # No vault copy at all.
+            out.append(replace(s, raw={**(s.raw or {}), "archive_status": "none"}))
+            continue
+        # Is the session still live? With an explicit live_probe (the archive-
+        # only store passes one), that set is authoritative. Otherwise infer it:
+        # a live copy would have won dedup, so "survivor is the archive copy"
+        # means no live twin was gathered.
+        if live_probe is not None:
+            is_live = key in live_probe
+        else:
+            is_live = not survivor_is_archive
+        badge = {"archived": True}
+        if not is_live:
+            # Truly deleted: in the vault, gone from every live source.
+            badge["archived_only"] = True
+            badge["archive_status"] = "archived"
+        else:
+            # Still live + a vault twin: up to date iff signatures match.
+            badge["archive_status"] = (
+                "archived" if _sig(s) == archived_sig[key] else "stale"
+            )
+        out.append(replace(s, raw={**(s.raw or {}), **badge}))
+    return out
 
 
 def _fold(sessions: list[Session]) -> list[Session]:

@@ -40,6 +40,12 @@ def session_summary(s: Session) -> dict[str, Any]:
         "tokens_cache_write": s.tokens_cache_write,
         "tokens_reasoning": s.tokens_reasoning,
         "git_branch": (s.raw or {}).get("git_branch"),
+        # Archive provenance: `archived` = a copy exists in the vault;
+        # `archived_only` = it exists ONLY in the vault (deleted from its agent);
+        # `archive_status` = none | archived | stale (drives the sync button).
+        "archived": bool((s.raw or {}).get("archived")),
+        "archived_only": bool((s.raw or {}).get("archived_only")),
+        "archive_status": (s.raw or {}).get("archive_status", "none"),
         "children": [session_summary(c) for c in s.children],
     }
 
@@ -78,6 +84,8 @@ def search_hit(h: SearchHit) -> dict[str, Any]:
         "short_id": h.session.short_id,
         "title": h.session.title,
         "directory": h.session.directory,
+        "archived": bool((h.session.raw or {}).get("archived")),
+        "archived_only": bool((h.session.raw or {}).get("archived_only")),
         "message_id": h.message.id,
         "role": h.message.role,
         "part_type": h.part.type,
