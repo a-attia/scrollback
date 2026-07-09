@@ -159,12 +159,39 @@ def test_footprint_catches_browser_profile_and_index(tmp_path, monkeypatch):
 
 def test_footprint_tags_vault_durable(tmp_path, monkeypatch):
     _isolate_home(tmp_path, monkeypatch)
-    from scrollback.archive import ArchiveStore
-    from scrollback.store import Store
-    from tests.test_archive import FakeSource, _session
+    from datetime import datetime, timezone
 
-    ArchiveStore(tmp_path / ".scrollback" / "archive").sync(
-        Store([FakeSource([_session("s1")])]))
+    from scrollback.archive import ArchiveStore
+    from scrollback.models import Message, Part, Session
+    from scrollback.sources.base import Source
+    from scrollback.store import Store
+
+    # Self-contained minimal source (avoid importing from another test module,
+    # which isn't an importable package in CI).
+    class _Src(Source):
+        name = "opencode"
+        label = "demo"
+
+        def is_available(self):
+            return True
+
+        def location(self):
+            return None
+
+        def list_sessions(self):
+            return iter(self._all)
+
+        def load_session(self, sid):
+            return next((s for s in self._all if s.id == sid), None)
+
+        _all = [Session(
+            id="s1", source="opencode", title="t", directory=None,
+            created=None, updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            message_count=1,
+            messages=(Message(id="m", role="user", created=None,
+                              parts=(Part(id="p", type="text", text="hi"),)),))]
+
+    ArchiveStore(tmp_path / ".scrollback" / "archive").sync(Store([_Src()]))
     durable = [e for e in launcher_install.footprint() if e.tier == "durable"]
     assert len(durable) == 1
     assert "archive" in str(durable[0].path)
