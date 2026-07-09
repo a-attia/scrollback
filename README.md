@@ -186,21 +186,126 @@ number; the cost figure (when available) is the most faithful summary of
 consumption. Sources that don't record a given figure show it as blank
 rather than a misleading zero.
 
+### Archiving sessions (keep them forever)
+
+Agents delete old sessions (Claude Code prunes after ~30 days by default).
+`scrollback archive` copies the sessions it reads into a durable, user-owned
+vault at `~/.scrollback/archive` and keeps them **forever**:
+
+```bash
+scrollback archive                        # incremental one-way sync -> vault
+scrollback archive --source opencode      # archive one source only
+scrollback archive --stats                # what's in the vault, per source
+scrollback archive --verify               # check archived files exist + parse
+scrollback archive --dest /path/to/vault  # or set $SCROLLBACK_ARCHIVE
+```
+
+The sync is **one-way and lossless** — your agent data is never modified,
+and every session is stored in full. Archived sessions are read back as a
+first-class source, so `list`, `show`, `search`, `stats`, and `export` all
+work over them, **including sessions the agent has already deleted**. A
+session that is still live is shown once (the live copy wins); one that
+exists only in the vault is marked as deleted. Use `--source archive` for an
+archive-only view.
+
+The vault is durable, user-owned data: it lives outside the disposable cache
+and **survives `scrollback uninstall`** unless you pass `--purge-archive`.
+
+#### Where your data lives
+
+Everything scrollback keeps for you lives under `~/.scrollback/` — **durable,
+user-owned, and yours to inspect, back up, or move**:
+
+```text
+~/.scrollback/
+└── archive/                       the vault (override: --dest / $SCROLLBACK_ARCHIVE)
+    ├── manifest.sqlite            index: (source, id) → signature + file path
+    └── sessions/
+        └── <source>/<id>.json     one lossless JSON per archived session
+```
+
+Each `<id>.json` is a complete, self-contained copy of one session (every
+message and its raw data). Nothing here is hidden or proprietary — it's plain
+JSON you can read, grep, or restore by hand. Distinct from the *disposable*
+`~/.cache/scrollback/` (search index, browser profile), which `uninstall`
+removes; the vault is not touched unless you ask.
+
+`scrollback archive --stats` prints the vault path, per-source counts, and
+this layout at any time.
+
+#### Backing up or moving the archive
+
+Because the vault is just files, backing it up or syncing it to another
+machine is a copy:
+
+```bash
+scrollback archive --export ~/Dropbox/scrollback-backup   # copy the whole vault
+scrollback archive --export backup.zip                    # ...or as a zip
+```
+
+The exported copy is a **faithful, re-importable vault** — point scrollback at
+it to use it directly:
+
+```bash
+SCROLLBACK_ARCHIVE=~/Dropbox/scrollback-backup scrollback archive --stats
+```
+
+To instead get **readable transcripts** (for sharing or reference, not a
+backup), add `--format rendered` (optionally `--doc-format html|json|text`):
+
+```bash
+scrollback archive --export ~/Desktop/my-sessions --format rendered
+```
+
+Rendered files are lossy and cannot be re-imported as a vault — use the
+default `vault` format for backups.
+
+#### Syncing two machines
+
+To combine the archives from two machines, **export on one and import on the
+other** — `--import` merges another vault (a directory or a `.zip`) into yours:
+
+```bash
+# on machine A
+scrollback archive --export a-vault.zip
+# copy a-vault.zip to machine B, then:
+scrollback archive --import a-vault.zip
+```
+
+The merge keys on `(source, id)`: sessions only present on A are added, and
+where both machines have the same session the **larger/newer copy wins** (the
+same never-shrink guard as normal archiving, so a merge can never lose
+messages). Run it in either direction — or both — to converge the two vaults.
+For continuous sync, point `$SCROLLBACK_ARCHIVE` at a shared folder
+(Dropbox / iCloud / Syncthing) instead; use one writer at a time to avoid
+`manifest.sqlite` write contention.
+
 ## The web app
 
-`scrollback web` starts a local, read-only browser UI — FastAPI plus a
-small vanilla-JavaScript frontend with no build step — bound to
-`127.0.0.1`. Open it with `scrollback web` (a browser tab),
-`scrollback web --window` (a standalone browser window), or
-`scrollback web --app` (a native desktop window; see
-[Running it as an app](#running-it-as-an-app)).
+`scrollback web` starts a local browser UI — FastAPI plus a small
+vanilla-JavaScript frontend with no build step — bound to `127.0.0.1`. It
+**never writes to your agents' data**; the only thing it can write is your own
+durable archive vault, and only when you click a sync button (see below).
+Open it with `scrollback web` (a browser tab), `scrollback web --window` (a
+standalone browser window), or `scrollback web --app` (a native desktop
+window; see [Running it as an app](#running-it-as-an-app)).
 
 What it offers:
 
+- A top-level **Live / Archive / All** mode switch: browse just your live
+  agents, just your durable archive (including sessions the agent deleted),
+  or both merged (the live copy wins for duplicates). The mode drives the
+  session list, search, and the stats page.
 - A **browse / stats** view switch in the header; the brand mark resets
   everything to the initial state.
 - A **session list** with source-filter chips and date filters, loading
-  incrementally as you scroll.
+  incrementally as you scroll. Each row carries a **provenance tag** —
+  *live*, *archived*, *stale*, or *deleted* — so you always know where a
+  session comes from.
+- **Web-driven archiving**: an **archive / update** button on each open
+  session, plus a **sync all** button on the archive landing view — each
+  with a live **progress bar**. These write only to your vault, never to your
+  agents.
 - An explicit **search scope** toggle — search session **titles**, message
   **contents**, or both at once (combined results are grouped).
 - **Subagents** collapsed under their parent, expandable on demand
@@ -321,6 +426,7 @@ point it elsewhere, and you can control how the web server binds:
 | `SCROLLBACK_PORT`        | web server port (default `8765`; or use `--port`)           |
 | `SCROLLBACK_HOST`        | web server bind host (default `127.0.0.1`; or use `--host`) |
 | `SCROLLBACK_INDEX`       | path to the search index database                          |
+| `SCROLLBACK_ARCHIVE`     | path to the durable archive vault (default `~/.scrollback/archive`) |
 
 The web server defaults to `127.0.0.1`. If the chosen port is busy,
 scrollback automatically picks the next free one (`--strict-port` fails
@@ -329,7 +435,8 @@ read-only API is unauthenticated.
 
 ## Safety
 
-scrollback is read-only by design, and the design is enforced:
+scrollback **never writes to your agents' data** — that invariant is the
+core of the design, and it is enforced:
 
 - The opencode SQLite database is opened with `mode=ro` — it is never
   created or written, and reads are safe against a live write-ahead log.
@@ -338,6 +445,11 @@ scrollback is read-only by design, and the design is enforced:
   across reads (`tests/test_sources_live.py`).
 - The web app binds to localhost, rejects unexpected `Host` headers (a
   DNS-rebinding guard), and sanitizes rendered transcript content.
+- The **only** thing scrollback ever writes is its own data: the disposable
+  cache/index and — when you archive — your durable vault at
+  `~/.scrollback/archive`. It never writes back to an agent's session store.
+  Archiving happens only on an explicit action: the `scrollback archive` CLI
+  command, or a sync button in the web UI (which writes to the vault only).
 
 ## Development
 

@@ -66,9 +66,36 @@ source, so browse/search/export/stats work over archived — even deleted —
 sessions. Reading stays strictly read-only; scrollback only ever writes to
 its own vault.
 
-Full design of record, phasing, and open questions:
-[`docs/archive-plan.md`](docs/archive-plan.md). **Planned; not started** —
-to be implemented in a dedicated session.
+Full design of record, phasing, and as-built notes:
+[`docs/archive-plan.md`](docs/archive-plan.md). **Phases 1–4 shipped**
+(as of 2026-07-08): the durable vault (`scrollback archive`), lossless
+round-trip, read-back as a first-class source (deduped live-wins), and the
+web badges + archive filter chip. **Phase 5 (multi-machine / cloud sync)
+remains future work.** Remaining follow-ups: web UI view/archive redesign
+(below), indexing the vault for fast search, and opt-in auto-sync.
+
+## Web UI redesign: browse-live vs. browse-archive
+
+The durable-archive feature (above) currently surfaces in the web UI as
+badges plus a tri-state filter chip bolted onto the single session list.
+That was the minimal integration; it does not give the archive its own
+first-class place, and archiving is CLI-only. Planned:
+
+- a top-level **Live / Archive / All** mode switch (default Live) that drives
+  the whole UI — session list, search, and the **statistics viewer**;
+- a per-row **provenance tag** (live / archived / deleted), important in All
+  mode and the discovery path in Live mode;
+- **web-driven archiving**: a per-session "archive / update" button (with a
+  per-session status: not archived / archived / stale) plus a global "sync
+  all", each with a **live progress bar** (Server-Sent Events);
+- a minimal **archive landing view** (vault path, per-source counts, deleted
+  count);
+- **UI-wide help affordances** (tooltips / help icons).
+
+This revises the earlier "web is strictly read-only" posture: the web app may
+now write to **your own vault** via explicit action, but **never to your
+agents' data** (the invariant that matters). Design of record:
+[`docs/web-redesign.md`](docs/web-redesign.md). **Planned; not started.**
 
 ## Other ideas
 
