@@ -719,11 +719,27 @@ def create_app(
         from fastapi.responses import HTMLResponse, Response
 
         _no_cache = {"Cache-Control": "no-cache, must-revalidate"}
+
+        def _asset_tag(name: str) -> str:
+            """A short content hash of a static asset, so the URL changes
+            whenever the file changes -- busting the WebView cache even within
+            the same version (the recurring stale-app.js problem in the native
+            app). Falls back to the app version if the file is unreadable."""
+            import hashlib
+
+            try:
+                data = (_STATIC_DIR / name).read_bytes()
+                return hashlib.sha1(data).hexdigest()[:12]
+            except OSError:
+                return __version__
+
+        _css_tag = _asset_tag("style.css")
+        _js_tag = _asset_tag("app.js")
         _index_html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
         _index_html = (
             _index_html
-            .replace('href="/style.css"', f'href="/style.css?v={__version__}"')
-            .replace('src="/app.js"', f'src="/app.js?v={__version__}"')
+            .replace('href="/style.css"', f'href="/style.css?v={_css_tag}"')
+            .replace('src="/app.js"', f'src="/app.js?v={_js_tag}"')
         )
 
         @app.get("/", include_in_schema=False)

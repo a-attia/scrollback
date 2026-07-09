@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Web assets bust the cache on content change.** `style.css` / `app.js` URLs
+  are now stamped with a short content hash (computed at server start) instead
+  of just the version, so any change to them forces a fresh fetch — fixing
+  stale-UI cases in the native app's WebView where an updated `app.js` (e.g.
+  the search titles/contents toggle) wasn't being picked up until a full quit
+  + relaunch.
+
 ### Added
 
 - **On-disk footprint visibility + complete uninstall.** `scrollback doctor`
