@@ -348,11 +348,78 @@ button { font-family: inherit; }
 .help-icon:hover, .help-icon:focus { color: var(--focus); outline: none; }
 
 /* archive landing view */
-.archive-landing { text-align: center; max-width: 34rem; }
-.archive-stat-row { display: flex; gap: 1.5rem; justify-content: center; margin: 1rem 0; }
-.archive-stat { font-size: 14px; color: var(--fg-dim); }
-.archive-stat b { color: var(--fg); font-size: 20px; }
-.archive-sources { list-style: none; padding: 0; color: var(--fg-dim); font-family: var(--mono); font-size: 12px; }
+.archive-landing { text-align: center; max-width: 44rem; margin: 0 auto; }
+.archive-landing h1 { font-size: 1.5rem; margin: 0 0 .3rem; }
+.archive-path { word-break: break-all; }
+.archive-size { color: var(--fg-faint); }
+
+/* stat cards: sessions kept / deleted / need-updating (clickable) */
+.archive-cards { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; margin: 1.4rem 0; }
+.archive-card {
+  display: flex; flex-direction: column; align-items: center; gap: .15rem;
+  min-width: 8.5rem; padding: .9rem 1rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  color: var(--fg-dim); font-size: 12px; cursor: default;
+}
+.archive-card b { color: var(--fg); font-size: 1.7rem; font-weight: 700; line-height: 1; }
+.archive-card-clickable { cursor: pointer; transition: border-color .12s, background .12s; }
+.archive-card-clickable:hover { border-color: var(--focus); background: var(--panel-2); }
+.archive-card[disabled] { opacity: .55; }
+.archive-card-deleted b { color: var(--claudecode); }
+.archive-card-stale b { color: var(--opencode); }
+
+/* per-source breakdown rows (clickable to filter) */
+.archive-sources-block { margin: 1rem auto; max-width: 22rem; }
+.archive-sub-label {
+  font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--fg-faint); margin-bottom: .4rem; text-align: left;
+}
+.archive-sources { display: flex; flex-direction: column; gap: .25rem; }
+.archive-source-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: .35rem .6rem; border: 1px solid var(--line); border-radius: 6px;
+  background: transparent; cursor: pointer; font-family: var(--mono); font-size: 12px;
+}
+.archive-source-row:hover { border-color: var(--focus); background: var(--panel); }
+.archive-source-row .src { color: var(--src); font-weight: 600; }
+.archive-source-n { color: var(--fg-dim); }
+
+/* integrity line */
+.archive-integrity { font-size: 12px; margin: 1rem 0; color: var(--fg-dim); }
+.archive-integrity.ok { color: var(--codex); }
+.archive-integrity.bad { color: var(--opencode); }
+
+/* action row + primary button + import */
+.archive-actions { display: flex; gap: .6rem; justify-content: center; flex-wrap: wrap; margin-top: 1.2rem; }
+.arc-primary { background: var(--focus); color: var(--ink); border-color: var(--focus); font-weight: 600; }
+.arc-primary:hover { filter: brightness(1.08); background: var(--focus); }
+.import-wrap { display: inline-flex; }
+
+/* "clear selection" button in the rail head (deselect the open session) */
+.clear-selection {
+  font-family: var(--mono); font-size: 10.5px; cursor: pointer;
+  color: var(--fg-dim); background: transparent;
+  border: 1px solid var(--line); border-radius: 5px; padding: .1rem .4rem;
+}
+.clear-selection:hover { color: var(--fg); border-color: var(--focus); }
+
+/* #6 "archive these" bulk button in the rail head */
+.archive-matching {
+  font-family: var(--mono); font-size: 10.5px; cursor: pointer;
+  color: var(--focus); background: var(--focus-soft);
+  border: 1px solid var(--focus); border-radius: 5px; padding: .1rem .4rem;
+}
+.archive-matching:hover { background: var(--focus); color: var(--ink); }
+
+/* #7 drill-down banner atop the session list */
+.drill-banner {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: .45rem .7rem; margin: 0; font-size: 11.5px; font-family: var(--mono);
+  color: var(--fg-dim); background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.drill-clear { background: none; border: none; color: var(--focus); cursor: pointer; font-size: 11.5px; }
+.drill-clear:hover { text-decoration: underline; }
+.loading-inline { color: var(--fg-faint); font-style: italic; }
 
 /* sync progress overlay */
 .progress-host {
@@ -450,11 +517,12 @@ body.viewing-stats .layout { grid-template-columns: 1fr; }
 
 .rail { border-right: 1px solid var(--line); overflow-y: auto; background: var(--ink); }
 .rail-head {
-  display: flex; justify-content: space-between; align-items: baseline;
+  display: flex; justify-content: space-between; align-items: center; gap: .5rem;
   padding: .55rem 1rem;
   position: sticky; top: 0; background: var(--ink);
   border-bottom: 1px solid var(--line); z-index: 2;
 }
+.rail-head .rail-hint { margin-left: auto; }
 .count { font-family: var(--mono); color: var(--fg); font-size: 12px; }
 .rail-hint { font-size: 11px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .08em; }
 

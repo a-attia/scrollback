@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from fastapi import FastAPI, HTTPException, Query, Response
+    from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
     from fastapi.staticfiles import StaticFiles
 except ModuleNotFoundError as exc:  # pragma: no cover - guidance path
     raise SystemExit(
@@ -88,8 +88,9 @@ class _JobRegistry:
         import threading
 
         self._jobs: dict[str, _SyncJob] = {}
-        self._lock = threading.Lock()
-        self._active_all: str | None = None  # single-flight guard for sync-all
+        self._lock = threading.Lock()          # guards _jobs / _active bookkeeping
+        self._writer_lock = threading.Lock()   # only one manifest writer at a time
+        self._active: str | None = None        # id of the currently-running job
 
     def get(self, job_id: str) -> "_SyncJob | None":
         return self._jobs.get(job_id)
@@ -97,35 +98,38 @@ class _JobRegistry:
     def start(self, kind: str, work) -> _SyncJob:
         """Register a job and run `work(job)` in a daemon thread.
 
-        For `kind="all"`, if a full sync is already running, its existing job is
-        returned instead of starting a second one (single-flight; the manifest
-        is a single SQLite writer).
+        ALL sync jobs write the manifest (a single SQLite file), so they must
+        not run concurrently. If any job is already active, a same-`kind`
+        request returns the running job (single-flight); otherwise the new job
+        waits on `_writer_lock` so writers are serialized (never two at once).
         """
         import threading
         import uuid
 
         with self._lock:
-            if kind == "all" and self._active_all:
-                existing = self._jobs.get(self._active_all)
-                if existing and not existing.finished.is_set():
-                    return existing
+            if self._active:
+                existing = self._jobs.get(self._active)
+                if existing and not existing.finished.is_set() and existing.kind == kind:
+                    return existing  # coalesce identical concurrent requests
             job = _SyncJob(uuid.uuid4().hex, kind)
             self._jobs[job.id] = job
-            if kind == "all":
-                self._active_all = job.id
 
         def run() -> None:
-            try:
-                work(job)
-            except Exception as exc:  # keep the failure visible to the client
-                job.error = str(exc)
-            finally:
-                job.phase = "done"
-                job.finished.set()
-                if kind == "all":
+            # Serialize all manifest writers: one at a time, no concurrent
+            # SQLite write handles on the same DB.
+            with self._writer_lock:
+                with self._lock:
+                    self._active = job.id
+                try:
+                    work(job)
+                except Exception as exc:  # keep the failure visible to the client
+                    job.error = str(exc)
+                finally:
+                    job.phase = "done"
+                    job.finished.set()
                     with self._lock:
-                        if self._active_all == job.id:
-                            self._active_all = None
+                        if self._active == job.id:
+                            self._active = None
 
         threading.Thread(target=run, daemon=True).start()
         return job
@@ -211,6 +215,18 @@ def create_app(
         archive_path if archive_path is not None
         else _archive_mod.default_archive_path()
     )
+
+    # One-time, off the request path: backfill meta_json for vaults archived
+    # before that column existed, so archive/all listings are pure-SQLite fast
+    # instead of parsing every session file.
+    def _backfill_bg() -> None:
+        try:
+            _archive_mod.ArchiveStore(_vault_path).backfill_meta()
+        except Exception:
+            pass
+    import threading as _threading
+    _threading.Thread(target=_backfill_bg, daemon=True).start()
+
     def _store_for(mode: str) -> Store:
         """Return the Store for a browsing mode (live | archive | all).
 
@@ -221,10 +237,10 @@ def create_app(
         """
         mode = mode if mode in ("live", "archive", "all") else "all"
         if mode == "live":
-            # Compose with the archive so live sessions still get an accurate
-            # archive-status tag (archived / stale) -- consistent with the other
-            # modes -- but hide sessions that exist ONLY in the vault (deleted).
-            return _live_store.with_archive(_vault_path, hide_archived_only=True)
+            # Live is the default + hot path: keep it live-only so it never pays
+            # the archive read cost. (Archive-status tags still show accurately
+            # in All / Archive modes.)
+            return _live_store
         if mode == "archive":
             # Live sources dropped; only the vault reader remains. Pass the live
             # session keys as a probe so a still-live archived session is
@@ -506,13 +522,53 @@ def create_app(
         if not vault.exists():
             return {"exists": False, "path": str(_vault_path)}
         s = vault.stats()
+        # Count stale sessions (still live but archived copy out of date) from
+        # the deduped "all" view, so the landing can offer "update all stale".
+        stale = sum(
+            1 for x in _store_for("all").list_sessions()
+            if (x.raw or {}).get("archive_status") == "stale"
+        )
         return {
             "exists": True,
             "path": str(vault.path),
             "sessions": s["sessions"],
             "orphans": s["orphans"],
+            "stale": stale,
             "per_source": s.get("per_source", {}),
+            "bytes": vault.disk_usage(),
         }
+
+    @app.get("/api/archive/verify")
+    def api_archive_verify() -> dict[str, Any]:
+        """Integrity check: counts of ok / missing / unreadable archived files."""
+        vault = _archive_mod.ArchiveStore(_vault_path)
+        if not vault.exists():
+            return {"exists": False}
+        v = vault.verify()
+        return {"exists": True, "ok": len(v["ok"]),
+                "missing": v["missing"], "unreadable": v["unreadable"]}
+
+    @app.get("/api/archive/export")
+    def api_archive_export():
+        """Download the whole vault as a .zip backup (re-importable)."""
+        import io
+        import zipfile
+
+        from starlette.responses import Response
+
+        vault = _archive_mod.ArchiveStore(_vault_path)
+        if not vault.exists():
+            raise HTTPException(status_code=404, detail="no archive to export")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in vault.path.rglob("*"):
+                if p.is_file():
+                    zf.write(p, arcname=str(p.relative_to(vault.path)))
+        _note_activity()
+        return Response(
+            content=buf.getvalue(), media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="scrollback-archive.zip"'},
+        )
 
     _jobs = _JobRegistry()
 
@@ -546,6 +602,66 @@ def create_app(
             job.result = {"outcome": outcome}
 
         job = _jobs.start("one", work)
+        return {"job_id": job.id, **job.snapshot()}
+
+    @app.post("/api/archive/sync/stale")
+    def api_archive_sync_stale() -> dict[str, Any]:
+        """Update every archived session whose live copy has newer content."""
+        vault = _archive_mod.ArchiveStore(_vault_path)
+
+        def work(job: _SyncJob) -> None:
+            _note_activity()
+            stale_keys = [
+                (s.source, s.id) for s in _store_for("all").list_sessions()
+                if (s.raw or {}).get("archive_status") == "stale"
+            ]
+            job.result = vault.sync_many(_live_store, stale_keys, progress=job.on_progress)
+
+        job = _jobs.start("all", work)
+        return {"job_id": job.id, **job.snapshot()}
+
+    @app.post("/api/archive/sync/batch")
+    def api_archive_sync_batch(payload: dict = Body(...)) -> dict[str, Any]:
+        """Archive/update a specific set of sessions (bulk action).
+
+        Body: ``{"keys": [["opencode","ses_..."], ...]}`` -- the (source, id)
+        pairs to archive (e.g. everything matching the current filter/search).
+        """
+        keys = [tuple(k) for k in payload.get("keys", []) if len(k) == 2]
+        vault = _archive_mod.ArchiveStore(_vault_path)
+
+        def work(job: _SyncJob) -> None:
+            _note_activity()
+            job.result = vault.sync_many(_live_store, keys, progress=job.on_progress)
+
+        job = _jobs.start("all", work)
+        return {"job_id": job.id, **job.snapshot()}
+
+    @app.post("/api/archive/import")
+    async def api_archive_import(request: "Request") -> dict[str, Any]:
+        """Merge an uploaded vault .zip into the local vault (cross-machine).
+
+        The .zip is sent as the raw request body (no multipart dependency).
+        """
+        import tempfile
+
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty upload")
+        tmp = Path(tempfile.mkdtemp(prefix="scrollback-upload-"))
+        zip_path = tmp / "incoming.zip"
+        zip_path.write_bytes(data)
+        vault = _archive_mod.ArchiveStore(_vault_path)
+
+        def work(job: _SyncJob) -> None:
+            _note_activity()
+            try:
+                job.result = vault.import_from(zip_path, progress=job.on_progress)
+            finally:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        job = _jobs.start("all", work)
         return {"job_id": job.id, **job.snapshot()}
 
     @app.get("/api/archive/jobs/{job_id}")
@@ -587,8 +703,9 @@ def create_app(
 
     @app.get("/api/health")
     def api_health() -> dict[str, Any]:
+        # Live agent sources only (the archive reader is a mode, not a source).
         return {"status": "ok", "version": __version__,
-                "sources": [s.name for s in _store.sources]}
+                "sources": [s.name for s in _live_store.sources]}
 
     # -- static frontend ---------------------------------------------------
 

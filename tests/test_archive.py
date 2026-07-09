@@ -287,6 +287,99 @@ def test_export_no_vault_is_noop(tmp_path):
     assert r["sessions"] == 0
 
 
+# -- security: zip-slip + path traversal ------------------------------------
+
+
+def test_import_rejects_zip_slip(tmp_path):
+    """A malicious zip with a '../' member must not write outside the temp dir."""
+    import zipfile
+
+    a = archive.ArchiveStore(tmp_path / "A")
+    a.sync(_store(_session("s1")))
+
+    evil = tmp_path / "evil.zip"
+    with zipfile.ZipFile(evil, "w") as zf:
+        zf.writestr("manifest.sqlite", "not a real db")
+        zf.writestr("../../pwned.txt", "escaped!")
+
+    # import_from opens the zip as a vault; the zip-slip member must be rejected
+    # (raises), and crucially must NOT create the escaped file.
+    import pytest
+    with pytest.raises((ValueError, FileNotFoundError, Exception)):
+        a.import_from(evil)
+    assert not (tmp_path.parent / "pwned.txt").exists()
+    assert not (tmp_path / "pwned.txt").exists()
+
+
+def test_safe_path_rejects_traversal(tmp_path):
+    """safe_path must refuse a manifest file_path that escapes the vault."""
+    v = archive.ArchiveStore(tmp_path / "v")
+    v.sync(_store(_session("s1")))
+    # legit relative path resolves inside the vault
+    assert v.safe_path("sessions/fake/s1.json") is not None
+    # traversal + absolute escapes are refused
+    assert v.safe_path("../../../../etc/passwd") is None
+    assert v.safe_path("/etc/passwd") is None
+    assert v.safe_path("") is None
+
+
+def test_import_with_traversal_file_path_reads_nothing(tmp_path):
+    """A crafted incoming manifest whose file_path points outside its vault must
+    not let import read arbitrary files."""
+    import sqlite3
+
+    # Build a fake incoming vault whose manifest points file_path at a secret.
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET", encoding="utf-8")
+    incoming = tmp_path / "incoming"
+    (incoming / "sessions").mkdir(parents=True)
+    conn = sqlite3.connect(incoming / "manifest.sqlite")
+    conn.executescript(archive._SCHEMA)
+    conn.execute(
+        "INSERT INTO archived (source, session_id, updated, message_count, file_path) "
+        "VALUES ('fake','evil','2026-01-01',1,'../secret.txt')")
+    conn.commit()
+    conn.close()
+
+    dst = archive.ArchiveStore(tmp_path / "dst")
+    dst.sync(_store(_session("keep")))
+    dst.import_from(incoming)   # must not import the secret
+    ids = {s.id for s in ArchiveSourceList(dst)}
+    assert "evil" not in ids
+    assert "keep" in ids
+
+
+def ArchiveSourceList(store):
+    from scrollback.sources.archive import ArchiveSource
+    return list(ArchiveSource(store.path).list_sessions())
+
+
+# -- security: never-shrink with unknown counts -----------------------------
+
+
+def test_never_shrink_when_archived_count_null(tmp_path):
+    """If the archived row has message_count NULL, a smaller re-read must still
+    be refused (file-size guard), not silently clobber the good copy."""
+    import sqlite3
+
+    v = archive.ArchiveStore(tmp_path / "v")
+    v.sync(_store(_session("s1", n_msgs=6)))
+    # Force the archived row's message_count to NULL (simulating an old row).
+    conn = sqlite3.connect(v.manifest_path)
+    conn.execute("UPDATE archived SET message_count = NULL WHERE session_id='s1'")
+    conn.commit()
+    conn.close()
+
+    # A smaller/newer re-read must be kept_shrunk (file-size guard).
+    outcome = v.sync_one(
+        _store(_session("s1", n_msgs=2, updated=_T0 + timedelta(hours=1))),
+        "fake", "s1")
+    assert outcome == "kept_shrunk"
+    restored = archivefmt.from_archive_json(
+        v._session_file("fake", "s1").read_text(encoding="utf-8"))
+    assert len(restored.messages) == 6
+
+
 # -- import / merge (cross-machine sync) ------------------------------------
 
 

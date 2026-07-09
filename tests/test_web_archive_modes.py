@@ -129,10 +129,10 @@ def test_archive_mode_still_live_session_is_archived_not_deleted(tmp_path):
 
 
 def test_archive_status_tag_is_consistent_across_modes(tmp_path):
-    """A live+archived session must carry the SAME archive tag in every mode
-    (live / all / archive) -- not 'live' in live view but 'archived' elsewhere.
-    Live view composes with the archive purely to annotate, hiding only the
-    sessions that exist solely in the vault (deleted from their agent)."""
+    """A live+archived session reads as 'archived' in All and Archive modes.
+    Live mode is intentionally live-only (no archive read) for performance, so
+    it always shows every live session; the archive tag appears in All/Archive.
+    """
     src = FakeSource([_session("s1"), _session("s2")])
     c = _client(tmp_path, src)
     # Archive only s1; s2 stays live-only.
@@ -147,23 +147,104 @@ def test_archive_status_tag_is_consistent_across_modes(tmp_path):
         rows = {s["id"]: s for s in c.get(f"/api/sessions?mode={mode}").json()["sessions"]}
         return rows["s1"]
 
-    for mode in ("live", "all", "archive"):
+    # All + Archive modes show the archive status.
+    for mode in ("all", "archive"):
         s1 = s1_of(mode)
         assert s1["archived"] is True, mode
         assert s1["archive_status"] == "archived", mode
         assert s1["archived_only"] is False, mode  # still live -> not deleted
 
-    # s2 (live-only) reads as not-archived in the modes that show it.
-    for mode in ("live", "all"):
-        rows = {s["id"]: s for s in c.get(f"/api/sessions?mode={mode}").json()["sessions"]}
-        assert rows["s2"]["archive_status"] == "none"
+    # Live mode is live-only: both sessions present, no archive read (status
+    # reflects live-only knowledge).
+    live_ids = {s["id"] for s in c.get("/api/sessions?mode=live").json()["sessions"]}
+    assert live_ids == {"s1", "s2"}
 
-    # Deleting s1 from live removes it from LIVE view but keeps it elsewhere.
+    # Deleting s1 from live: gone from live, still browsable via the archive.
     del src._sessions["s1"]
     live_ids = {s["id"] for s in c.get("/api/sessions?mode=live").json()["sessions"]}
     all_ids = {s["id"] for s in c.get("/api/sessions?mode=all").json()["sessions"]}
-    assert "s1" not in live_ids       # deleted-from-agent hidden in live view
-    assert "s1" in all_ids            # still browsable via the archive
+    assert "s1" not in live_ids
+    assert "s1" in all_ids
+
+
+def test_archive_overview_has_disk_and_stale(tmp_path):
+    src = FakeSource([_session("s1"), _session("s2")])
+    c = _client(tmp_path, src)
+    _sync_all(c)
+    ov = c.get("/api/archive").json()
+    assert ov["bytes"] > 0
+    assert ov["stale"] == 0
+    # make s1 stale
+    src._sessions["s1"] = _session("s1", n_msgs=9, updated=_T0.replace(hour=2))
+    assert c.get("/api/archive").json()["stale"] == 1
+
+
+def test_archive_verify_endpoint(tmp_path):
+    c = _client(tmp_path, FakeSource([_session("s1")]))
+    assert c.get("/api/archive/verify").json() == {"exists": False}
+    _sync_all(c)
+    v = c.get("/api/archive/verify").json()
+    assert v["exists"] and v["ok"] == 1 and v["missing"] == [] and v["unreadable"] == []
+
+
+def test_archive_export_download(tmp_path):
+    c = _client(tmp_path, FakeSource([_session("s1"), _session("s2")]))
+    assert c.get("/api/archive/export").status_code == 404   # no vault yet
+    _sync_all(c)
+    r = c.get("/api/archive/export")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+    assert r.content[:2] == b"PK"   # zip magic
+
+
+def test_archive_update_stale_endpoint(tmp_path):
+    src = FakeSource([_session("s1", n_msgs=2)])
+    c = _client(tmp_path, src)
+    _sync_all(c)
+    src._sessions["s1"] = _session("s1", n_msgs=5, updated=_T0.replace(hour=3))
+    assert c.get("/api/archive").json()["stale"] == 1
+    j = c.post("/api/archive/sync/stale").json()
+    for _ in range(100):
+        if c.get(f"/api/archive/jobs/{j['job_id']}").json()["finished"]:
+            break
+        time.sleep(0.02)
+    assert c.get("/api/archive").json()["stale"] == 0
+
+
+def test_archive_batch_endpoint(tmp_path):
+    c = _client(tmp_path, FakeSource([_session("s1"), _session("s2"), _session("s3")]))
+    j = c.post("/api/archive/sync/batch", json={"keys": [["fake", "s1"], ["fake", "s3"]]}).json()
+    for _ in range(100):
+        if c.get(f"/api/archive/jobs/{j['job_id']}").json()["finished"]:
+            break
+        time.sleep(0.02)
+    res = c.get(f"/api/archive/jobs/{j['job_id']}").json()["result"]
+    assert res["added"] == 2
+    ids = {s["id"] for s in c.get("/api/sessions?mode=archive").json()["sessions"]}
+    assert ids == {"s1", "s3"}   # s2 not archived
+
+
+def test_archive_import_endpoint(tmp_path):
+    # Build a source vault, export it, then import the zip via the endpoint.
+    src_c = _client(tmp_path, FakeSource([_session("x1"), _session("x2")]))
+    _sync_all(src_c)
+    zip_bytes = src_c.get("/api/archive/export").content
+
+    dst = TestClient(create_app(Store([FakeSource([_session("y1")])]),
+                               allowed_hosts=[], archive_path=tmp_path / "dst"))
+    dst.post("/api/archive/sync")  # seed y1
+    for _ in range(100):
+        if not dst.get("/api/archive").json().get("exists"):
+            time.sleep(0.02)
+        else:
+            break
+    j = dst.post("/api/archive/import", content=zip_bytes).json()
+    for _ in range(100):
+        if dst.get(f"/api/archive/jobs/{j['job_id']}").json()["finished"]:
+            break
+        time.sleep(0.02)
+    ids = {s["id"] for s in dst.get("/api/sessions?mode=archive").json()["sessions"]}
+    assert {"x1", "x2"} <= ids   # merged in
 
 
 def test_archive_source_not_listed_as_a_filter_chip(tmp_path):

@@ -31,6 +31,7 @@ differences (see the plan, §2 + §7.3):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sqlite3
@@ -77,6 +78,44 @@ def _safe_component(name: str) -> str:
     return safe
 
 
+def _safe_extract_zip(zip_path: "Path", dest: "Path") -> None:
+    """Extract a zip, rejecting entries that would escape `dest` (zip-slip).
+
+    Imported zips are untrusted (uploaded via the web import endpoint), so an
+    entry named ``../../foo``, an absolute path, or a symlink must never write
+    outside the temp extraction dir. Each member's resolved target is checked
+    to stay within `dest`; symlink entries are skipped.
+    """
+    import stat
+    import zipfile
+
+    dest = dest.resolve()
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            # Skip symlinks (their "content" is a path that could point anywhere).
+            mode = (info.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(mode):
+                continue
+            target = (dest / info.filename).resolve()
+            if target != dest and dest not in target.parents:
+                raise ValueError(f"unsafe path in zip archive: {info.filename!r}")
+            zf.extract(info, dest)
+
+
+def _summary_json(session) -> str:
+    """A compact JSON metadata summary stored in the manifest, so the archive
+    can be *listed* without parsing every full session file. Mirrors the
+    lightweight list shape (`serialize.session_summary`) minus children/
+    messages (a listing never needs those)."""
+    import json as _json
+
+    from .serialize import session_summary
+
+    d = session_summary(session)
+    d.pop("children", None)
+    return _json.dumps(d, ensure_ascii=False)
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -91,6 +130,7 @@ CREATE TABLE IF NOT EXISTS archived (
     last_synced TEXT,
     last_seen_live TEXT,
     file_path TEXT,
+    meta_json TEXT,
     PRIMARY KEY (source, session_id)
 );
 """
@@ -119,21 +159,52 @@ class ArchiveStore:
             / f"{_safe_component(session_id)}.json"
         )
 
+    def safe_path(self, rel_path: str) -> Path | None:
+        """Resolve a manifest `file_path` to an absolute path, but ONLY if it
+        stays inside this vault. Returns None for anything that would escape
+        (absolute paths, ``..`` traversal) -- manifests from an imported vault
+        are untrusted, so a crafted `file_path` must never read outside here."""
+        if not rel_path:
+            return None
+        base = self.path.resolve()
+        target = (self.path / rel_path).resolve()
+        if target == base or base in target.parents:
+            return target
+        return None
+
     def exists(self) -> bool:
         return self.manifest_path.is_file()
 
     # -- connection ---------------------------------------------------------
 
-    def _connect(self, *, write: bool) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self, *, write: bool):
+        """Context manager yielding a manifest connection that is always CLOSED
+        on exit (and committed on the write path). `with sqlite3.connect(...)`
+        alone only commits -- it leaks the connection -- so we manage it here."""
         if write:
             self.path.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(self.manifest_path)
+            conn = sqlite3.connect(self.manifest_path, timeout=30.0)
+            # Wait up to 30s for a competing writer instead of erroring instantly
+            # (defense in depth; the web layer already serializes its writers).
+            conn.execute("PRAGMA busy_timeout = 30000")
             conn.executescript(_SCHEMA)
+            # Migrate older manifests that predate the meta_json column (added so
+            # listing reads metadata from SQLite instead of parsing every JSON).
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(archived)")}
+            if "meta_json" not in cols:
+                conn.execute("ALTER TABLE archived ADD COLUMN meta_json TEXT")
+                conn.commit()
         else:
             uri = f"file:{self.manifest_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+            if write:
+                conn.commit()
+        finally:
+            conn.close()
 
     # -- sync ---------------------------------------------------------------
 
@@ -246,17 +317,40 @@ class ArchiveStore:
 
         # Never-shrink guard: refuse to overwrite a larger archived copy with a
         # smaller freshly-read one (corruption / partial read / truncation).
-        if prev is not None and prev["message_count"] is not None:
+        # Compare like-for-like: `message_count` if the source reports it, else
+        # the actual number of loaded messages -- on BOTH the archived and the
+        # new copy, so the comparison is consistent. If the archived count is
+        # unknown (NULL) we fall back to the byte size of the stored file, so a
+        # truncated re-read still can't silently clobber a good copy.
+        if prev is not None:
             new_count = sess.message_count
             if new_count is None:
                 new_count = len(sess.messages)
-            if new_count < prev["message_count"]:
-                conn.execute(
-                    "UPDATE archived SET last_seen_live = ? "
-                    "WHERE source = ? AND session_id = ?",
-                    (now, meta.source, meta.id),
-                )
-                return "kept_shrunk"
+            prev_count = prev["message_count"]
+            if prev_count is not None:
+                if new_count < prev_count:
+                    conn.execute(
+                        "UPDATE archived SET last_seen_live = ? "
+                        "WHERE source = ? AND session_id = ?",
+                        (now, meta.source, meta.id),
+                    )
+                    return "kept_shrunk"
+            else:
+                # Archived count unknown: guard on file size as a proxy -- never
+                # replace a non-empty archived file with a strictly smaller one.
+                existing = self._session_file(meta.source, meta.id)
+                new_bytes = len(archivefmt.to_archive_json(sess, indent=2).encode("utf-8"))
+                try:
+                    old_bytes = existing.stat().st_size if existing.is_file() else 0
+                except OSError:
+                    old_bytes = 0
+                if old_bytes and new_bytes < old_bytes:
+                    conn.execute(
+                        "UPDATE archived SET last_seen_live = ? "
+                        "WHERE source = ? AND session_id = ?",
+                        (now, meta.source, meta.id),
+                    )
+                    return "kept_shrunk"
 
         dest = self._session_file(meta.source, meta.id)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -265,14 +359,15 @@ class ArchiveStore:
         first_archived = prev["first_archived"] if prev is not None else now
         conn.execute(
             "INSERT OR REPLACE INTO archived (source, session_id, updated, "
-            "message_count, first_archived, last_synced, last_seen_live, file_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "message_count, first_archived, last_synced, last_seen_live, file_path, "
+            "meta_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 meta.source, meta.id,
                 sess.updated.isoformat() if sess.updated else None,
                 sess.message_count,
                 first_archived, now, now,
                 str(dest.relative_to(self.path)),
+                _summary_json(sess),
             ),
         )
         return "added" if prev is None else "updated"
@@ -287,7 +382,7 @@ class ArchiveStore:
         seen live at the last sync (deleted from their agent).
         """
         if not self.exists():
-            return {"sessions": 0, "orphans": 0}
+            return {"sessions": 0, "orphans": 0, "per_source": {}}
         with self._connect(write=False) as conn:
             total = conn.execute("SELECT COUNT(*) FROM archived").fetchone()[0]
             last_sync_row = conn.execute(
@@ -309,6 +404,67 @@ class ArchiveStore:
             }
         return {"sessions": total, "orphans": orphans, "per_source": per_source}
 
+    def backfill_meta(self) -> int:
+        """One-time: populate `meta_json` for rows that lack it (vaults archived
+        before the column existed), so listings become pure-SQLite fast. Parses
+        each such file ONCE. Returns the count backfilled; no-op once complete."""
+        if not self.exists():
+            return 0
+        with self._connect(write=True) as conn:
+            rows = list(conn.execute(
+                "SELECT source, session_id, file_path FROM archived "
+                "WHERE meta_json IS NULL"
+            ))
+            n = 0
+            for r in rows:
+                path = self.safe_path(r["file_path"])
+                if path is None or not path.is_file():
+                    continue
+                try:
+                    sess = archivefmt.from_archive_json(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, KeyError):
+                    continue
+                conn.execute(
+                    "UPDATE archived SET meta_json = ? WHERE source = ? AND session_id = ?",
+                    (_summary_json(sess), r["source"], r["session_id"]),
+                )
+                n += 1
+            if n:
+                conn.commit()
+        return n
+
+    def disk_usage(self) -> int:
+        """Total bytes on disk for the whole vault (manifest + session files)."""
+        if not self.exists():
+            return 0
+        total = 0
+        for p in self.path.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    def sync_many(self, store: "Store", keys, *, progress=None) -> dict[str, int]:
+        """Archive/update a specific set of `(source, id)` sessions.
+
+        Used by the web UI's bulk actions ("update all stale", "archive all
+        matching this filter"). Same per-session semantics as :meth:`sync_one`
+        (signature skip + never-shrink guard); does not prune. `keys` is an
+        iterable of `(source, session_id)` tuples.
+        """
+        stats = {"added": 0, "updated": 0, "unchanged": 0, "kept_shrunk": 0}
+        keys = list(keys)
+        total = len(keys)
+        for i, (source, sid) in enumerate(keys):
+            outcome = self.sync_one(store, source, sid)
+            if outcome in stats:
+                stats[outcome] += 1
+            if progress:
+                progress(i + 1, total)
+        return stats
+
     # -- integrity ----------------------------------------------------------
 
     def verify(self) -> dict[str, list[str]]:
@@ -328,7 +484,7 @@ class ArchiveStore:
             ))
         for r in rows:
             label = f"{r['source']}:{r['session_id']}"
-            path = self.path / r["file_path"] if r["file_path"] else None
+            path = self.safe_path(r["file_path"])
             if path is None or not path.is_file():
                 result["missing"].append(label)
                 continue
@@ -417,15 +573,13 @@ class ArchiveStore:
         extracted to a temp dir (cleaned up on exit); otherwise yielded as-is."""
         import contextlib
         import tempfile
-        import zipfile
 
         @contextlib.contextmanager
         def _cm():
             if path.is_file() and str(path).endswith(".zip"):
                 tmp = tempfile.mkdtemp(prefix="scrollback-import-")
                 try:
-                    with zipfile.ZipFile(path) as zf:
-                        zf.extractall(tmp)
+                    _safe_extract_zip(path, Path(tmp))
                     yield Path(tmp)
                 finally:
                     import shutil
@@ -447,7 +601,7 @@ class ArchiveStore:
                 "SELECT source, session_id, file_path FROM archived"
             ))
         for r in rows:
-            path = self.path / r["file_path"] if r["file_path"] else None
+            path = self.safe_path(r["file_path"])
             if path is None or not path.is_file():
                 continue
             try:

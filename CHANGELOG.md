@@ -6,58 +6,68 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-09
+
+Durable session archive: keep your AI-agent sessions forever, browse and
+manage them in the web UI, and back up / sync them across machines.
+
 ### Added
 
-- **Archive export / backup + cross-machine merge.**
-  `scrollback archive --export <dest>` copies the whole vault to a directory or
-  `.zip` as a **faithful, re-importable backup**; `--format rendered` instead
-  writes readable transcripts (markdown / html / json / text) for sharing.
-  `scrollback archive --import <vault>` **merges another vault** (directory or
-  `.zip`, e.g. one exported on another machine) into yours — keyed on
-  `(source, id)`, larger/newer copy wins, and the never-shrink guard means a
-  merge can never lose messages. Run it in either direction to converge two
-  machines. `scrollback archive --stats` prints the vault layout + these
-  commands, and the README documents the `~/.scrollback/` structure and the
-  export/import sync flow.
+- **Durable session archive ("keep sessions forever").** `scrollback archive`
+  copies the sessions scrollback reads into a user-owned vault at
+  `~/.scrollback/archive` (override with `--dest` or `$SCROLLBACK_ARCHIVE`) and
+  keeps them **forever**, surviving the agents' own auto-deletion (e.g. Claude
+  Code's ~30-day cleanup). The sync is one-way, incremental, and lossless
+  (every `raw` blob kept); your agent data is never modified.
+  - Archived sessions are read back as a first-class source, so `list` / `show`
+    / `search` / `stats` / `export` all work over them — **including sessions
+    the agent has already deleted**.
+  - A session that is both live and archived is shown once (live wins); one
+    that exists only in the vault is marked as deleted.
+  - **CLI:** `scrollback archive` (sync), `--stats` (counts + vault layout),
+    `--verify` (integrity), `--source archive` (archive-only view); wired into
+    `doctor`. Kept on `uninstall` unless `--purge-archive` is given.
 
-- **Web UI: Live / Archive / All mode + web-driven archiving.** A top-level
-  mode switch scopes the whole UI — session list, search, and the stats page —
-  to your live agents, your durable archive (including deleted sessions), or
-  both merged. Each session row now carries a provenance tag (live / archived /
-  stale / deleted). You can **archive or update a session from the web** (a
-  button on each open session) and **sync everything** (from the archive
-  landing view), each with a live progress bar. These write only to your vault.
-  A minimal archive landing view shows the vault path and per-source counts,
-  and UI-wide help tooltips explain the terms.
+- **Backup + cross-machine sync.** `scrollback archive --export <dest>` writes
+  a **faithful, re-importable** copy of the vault to a directory or `.zip`
+  (`--format rendered` instead writes readable transcripts — markdown / html /
+  json / text — for sharing, not backup). `scrollback archive --import <vault>`
+  **merges another vault** into yours (keyed on `(source, id)`, larger/newer
+  copy wins, never loses messages) — run either direction to converge two
+  machines.
+
+- **Web UI: Live / Archive / All mode + web-driven archive management.** A
+  top-level mode switch scopes the whole UI — session list, search, and stats —
+  to live agents, the durable archive (incl. deleted sessions), or both merged.
+  Each row carries a provenance tag (live / live+archived / stale / deleted).
+  The Archive view is a dashboard: disk usage, integrity check, clickable stat
+  cards (kept / deleted-from-agent / needs-updating), per-source drill-down,
+  and **Export .zip / Import .zip / Archive all / Update stale** actions with a
+  live progress bar (Server-Sent Events). Per-session "archive / update" button
+  in the transcript header; a contextual "archive these" bulk action for the
+  current filter/search; a "clear selection" control; UI-wide help tooltips.
 
 ### Changed
 
-- **Read-only posture, restated.** scrollback still **never writes to your
-  agents' data**. The web app is no longer "writes nothing at all": it can now
-  write to your own durable vault via the explicit sync buttons above. The
-  session-store read-only invariant is unchanged and still test-enforced.
+- **Read-only posture, restated precisely.** scrollback still **never writes to
+  your agents' data** (test-enforced). The web app is no longer "writes nothing
+  at all": it can now write to your own durable vault via explicit sync
+  actions. Only the vault is ever written.
+- Faster archive listing: session metadata is stored in the manifest so the
+  archive is listed from SQLite instead of parsing every session file (with a
+  one-time background backfill for pre-existing vaults).
 
-- **Durable session archive ("keep sessions forever").** A new
-  `scrollback archive` command copies the sessions scrollback reads into a
-  user-owned vault at `~/.scrollback/archive` (override with `--dest` or
-  `$SCROLLBACK_ARCHIVE`) and keeps them **forever**, surviving the agents'
-  own auto-deletion (e.g. Claude Code's ~30-day cleanup). The sync is
-  one-way and incremental; your agent data is never modified.
-  - **Lossless & re-readable.** Archived sessions are stored losslessly
-    (keeping every `raw` blob) and read back as a first-class source, so
-    `list` / `show` / `search` / `stats` / `export` all work over archived
-    sessions — **including ones the agent has already deleted**.
-  - **Live wins, no duplicates.** A session that exists both live and
-    archived is shown once (the fresher live copy); a session that exists
-    only in the vault is badged as deleted.
-  - **CLI:** `scrollback archive` (sync), `--stats`, `--verify` (integrity),
-    `--source archive` (archive-only view); wired into `doctor`. The durable
-    vault is kept on `uninstall` unless `--purge-archive` is given.
-  - **Web UI:** archived / deleted badges on session rows and the transcript
-    header, plus a tri-state archive filter chip (all / archived / deleted).
-    The web app stays strictly read-only — syncing is a CLI verb only.
+### Security
 
-  Design of record and phasing: [`docs/archive-plan.md`](docs/archive-plan.md).
+- **Import hardening.** Importing a vault `.zip` now validates every entry
+  against zip-slip (path traversal / absolute paths / symlinks are rejected),
+  and reading a session file validates the manifest's `file_path` stays inside
+  the vault — so a maliciously-crafted vault or zip cannot read or write
+  outside `~/.scrollback`.
+- Archive-writing operations are serialized (single writer) with a SQLite busy
+  timeout, preventing manifest corruption/lock errors under concurrent syncs.
+- The never-shrink guard (a re-read with fewer messages can't overwrite a good
+  archived copy) now also covers rows with an unknown message count.
 
 ## [0.3.2] - 2026-06-30
 

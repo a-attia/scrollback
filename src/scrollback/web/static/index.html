@@ -97,6 +97,14 @@
     <aside class="rail" id="rail">
       <div class="rail-head">
         <span id="count" class="count">&mdash;</span>
+        <button id="clear-selection" class="clear-selection" hidden
+                title="Deselect the open session and clear the reader">
+          &times; clear selection
+        </button>
+        <button id="archive-matching" class="archive-matching" hidden
+                title="Archive the sessions currently listed (matching your filter/search)">
+          &#8681; archive these
+        </button>
         <span class="rail-hint">newest first</span>
       </div>
       <ul class="sessions" id="sessions"></ul>

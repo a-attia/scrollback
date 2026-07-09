@@ -450,6 +450,10 @@ core of the design, and it is enforced:
   `~/.scrollback/archive`. It never writes back to an agent's session store.
   Archiving happens only on an explicit action: the `scrollback archive` CLI
   command, or a sync button in the web UI (which writes to the vault only).
+- Importing a vault (from `--import` or the web Import button) treats the
+  incoming `.zip`/manifest as untrusted: entries that would escape the vault
+  (zip-slip, `..`, absolute paths, symlinks) are rejected, so a malicious
+  archive can't read or write outside `~/.scrollback`.
 
 ## Development
 

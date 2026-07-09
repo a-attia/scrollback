@@ -64,8 +64,25 @@ class ArchiveSource(Source):
                 )
             ]
 
+    def _manifest_meta_rows(self):
+        """Return (source, session_id, file_path, meta_json) for the whole vault.
+
+        `meta_json` is the compact metadata summary written at archive time, so
+        listing does NOT need to open and parse every session file."""
+        if not self._store.exists():
+            return []
+        with self._store._connect(write=False) as conn:
+            return [
+                (r["source"], r["session_id"], r["file_path"], r["meta_json"])
+                for r in conn.execute(
+                    "SELECT source, session_id, file_path, meta_json FROM archived"
+                )
+            ]
+
     def _read_file(self, rel_path: str) -> Session | None:
-        path = self._store.path / rel_path
+        path = self._store.safe_path(rel_path)   # rejects traversal outside the vault
+        if path is None:
+            return None
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
@@ -78,19 +95,51 @@ class ArchiveSource(Source):
     # -- Source contract ----------------------------------------------------
 
     def list_sessions(self) -> Iterator[Session]:
-        """Yield metadata-only sessions (messages stripped) for the whole vault.
+        """Yield metadata-only sessions for the whole vault.
 
-        Each session keeps its original ``source`` and carries
-        ``raw["archived"] = True`` so the read-back path is distinguishable.
+        Reads metadata from the manifest's ``meta_json`` (fast; no per-file
+        parsing). Each session keeps its original ``source`` and carries
+        ``raw["archived"] = True``. Rows written before ``meta_json`` existed
+        fall back to parsing the file (and will get a meta_json on next sync).
         """
+        import json as _json
         from dataclasses import replace
 
-        for _source, _sid, rel in self._manifest_rows():
+        for _source, _sid, rel, meta_json in self._manifest_meta_rows():
+            if meta_json:
+                try:
+                    d = _json.loads(meta_json)
+                except ValueError:
+                    d = None
+                if d is not None:
+                    yield self._session_from_summary(d)
+                    continue
+            # Fallback for pre-meta_json rows: parse the file (slow path).
             sess = self._read_file(rel)
             if sess is None:
                 continue
             raw = {**(sess.raw or {}), "archived": True}
             yield replace(sess, messages=(), raw=raw)
+
+    @staticmethod
+    def _session_from_summary(d: dict) -> Session:
+        """Build a metadata-only Session from a stored summary dict."""
+        from ..models import _to_dt
+
+        return Session(
+            id=d["id"], source=d["source"], title=d.get("title", ""),
+            directory=d.get("directory"),
+            created=_to_dt(d.get("created")), updated=_to_dt(d.get("updated")),
+            model=d.get("model"), agent=d.get("agent"),
+            parent_id=d.get("parent_id"), message_count=d.get("message_count"),
+            cost=d.get("cost"),
+            tokens_input=d.get("tokens_input"), tokens_output=d.get("tokens_output"),
+            tokens_cache_read=d.get("tokens_cache_read"),
+            tokens_cache_write=d.get("tokens_cache_write"),
+            tokens_reasoning=d.get("tokens_reasoning"),
+            raw={"archived": True,
+                 **({"git_branch": d["git_branch"]} if d.get("git_branch") else {})},
+        )
 
     def load_session(self, session_id: str) -> Session | None:
         """Load one archived session fully by its (original) id.

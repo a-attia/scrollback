@@ -249,6 +249,10 @@ const state = {
   // Top-level browse mode: "live" (default) | "archive" | "all". Drives the
   // session list, search, and the stats viewer via the API `mode` param.
   mode: "live",
+  // Archive-landing drill-down filter: null | "deleted" | "source".
+  // Applied client-side on top of the mode's results.
+  archiveFilterKind: null,
+  archiveFilterSource: null,
   // search scope: which targets the query is matched against.
   scope: { titles: true, contents: false },
   query: "",
@@ -359,6 +363,59 @@ function enabledParam() {
   return state.enabled.size === 1 ? [...state.enabled][0] : null;
 }
 
+// Client-side drill-down from the archive landing (deleted-only, or a chosen
+// source). Cleared by clearArchiveDrill().
+function passesArchiveDrill(s) {
+  if (state.archiveFilterKind === "deleted") return !!s.archived_only;
+  if (state.archiveFilterKind === "source") return s.source === state.archiveFilterSource;
+  return true;
+}
+
+function clearArchiveDrill() {
+  state.archiveFilterKind = null;
+  state.archiveFilterSource = null;
+  resetAndLoad();
+}
+
+// #6 "archive these": show the bulk button when the list is narrowed by a
+// filter/search/drill AND some shown sessions aren't up-to-date in the vault.
+let _matchingKeys = [];
+function updateArchiveMatching(rows) {
+  const btn = $("#archive-matching");
+  if (!btn) return;
+  const narrowed = !!(state.query || state.since || state.until
+    || enabledParam() || state.archiveFilterKind);
+  // Candidates: live sessions not already archived-and-current.
+  const todo = rows.filter((s) => !s.archived_only
+    && (s.archive_status === "none" || s.archive_status === "stale"));
+  _matchingKeys = todo.map((s) => [s.source, s.id]);
+  if (narrowed && todo.length) {
+    btn.hidden = false;
+    btn.textContent = `\u2b07 archive these ${todo.length}`;
+  } else {
+    btn.hidden = true;
+  }
+}
+
+async function archiveMatching() {
+  if (!_matchingKeys.length) return;
+  await runSyncJob("/api/archive/sync/batch", `Archiving ${_matchingKeys.length} sessions\u2026`,
+    { json: { keys: _matchingKeys } });
+  resetAndLoad();
+}
+
+// A dismissible banner shown atop the list when an archive drill-down is on.
+function archiveDrillBanner() {
+  if (!state.archiveFilterKind) return null;
+  const label = state.archiveFilterKind === "deleted"
+    ? "deleted from agent (archive only)"
+    : `source: ${SRC_LABEL[state.archiveFilterSource] || state.archiveFilterSource}`;
+  return el("li", { class: "drill-banner" },
+    el("span", {}, "filtered: " + label),
+    el("button", { class: "drill-clear", title: "Clear this filter",
+      onclick: clearArchiveDrill }, "\u00d7 clear"));
+}
+
 // -- browse mode (live / archive / all) ------------------------------------
 
 function initMode() {
@@ -366,8 +423,15 @@ function initMode() {
   state.mode = ["live", "archive", "all"].includes(saved) ? saved : "live";
   document.querySelectorAll("#modeswitch .mode-btn").forEach((btn) => {
     btn.setAttribute("aria-checked", btn.dataset.mode === state.mode ? "true" : "false");
-    btn.onclick = () => setMode(btn.dataset.mode);
+    // A manual mode switch clears any archive-landing drill-down filter.
+    btn.onclick = () => { clearArchiveDrillState(); setMode(btn.dataset.mode); resetAndLoad(); };
   });
+}
+
+// Clear drill state WITHOUT reloading (callers reload).
+function clearArchiveDrillState() {
+  state.archiveFilterKind = null;
+  state.archiveFilterSource = null;
 }
 
 function setMode(mode) {
@@ -377,22 +441,10 @@ function setMode(mode) {
   document.querySelectorAll("#modeswitch .mode-btn").forEach((btn) => {
     btn.setAttribute("aria-checked", btn.dataset.mode === mode ? "true" : "false");
   });
-  // Archive mode with nothing open -> show the archive landing overview.
-  // (The stats view shows live + archive groups regardless of mode, so it
-  // does not need reloading on a mode change.)
-  if (isStatsOpen()) {
-    // stay on stats; nothing mode-dependent to refresh
-  } else if (mode === "archive" && !state.current) {
-    showArchiveLanding();
-  } else if (!state.current) {
-    // Leaving the archive landing back to a normal empty reader.
-    const empty = $("#empty");
-    empty.hidden = false;
-    empty.replaceChildren(
-      el("img", { class: "empty-icon", src: "/favicon.svg", width: "112", height: "112", alt: "scrollback" }),
-      el("p", {}, "Pick a session on the left, or search to dig through everything."),
-      el("p", { class: "empty-sub" }, "Reading is local; scrollback never writes to your agents."));
-  }
+  // Switching mode is a top-level "change what I'm browsing" action: close any
+  // open transcript and return to the mode's home. The stats view is
+  // mode-independent, so if it's open we leave it up.
+  if (!isStatsOpen()) deselectSession();
   resetAndLoad();
 }
 
@@ -476,12 +528,15 @@ async function loadSessions(reset) {
   if (src) p.set("source", src);
 
   const data = await getJSON("/api/sessions?" + p.toString());
-  let rows = data.sessions.filter((s) => state.enabled.has(s.source));
+  let rows = data.sessions.filter((s) => state.enabled.has(s.source) && passesArchiveDrill(s));
   state.list.hasMore = data.has_more;
   state.list.offset += data.sessions.length;
+  updateArchiveMatching(rows);
 
   if (reset) {
     sessionsEl.replaceChildren();
+    const drill = archiveDrillBanner();
+    if (drill) sessionsEl.append(drill);
     $("#count").textContent = `${rows.length}${data.has_more ? "+" : ""} sessions`;
   } else {
     const prev = parseInt($("#count").dataset.n || "0", 10) + rows.length;
@@ -689,6 +744,7 @@ function isCurrent(s) {
   return state.current && state.current.source === s.source && state.current.id === s.id;
 }
 function markActiveRow() {
+  updateClearSelection();
   document.querySelectorAll(".session.active, .s-child.active").forEach((n) => n.classList.remove("active"));
   if (!state.current) return;
   const sel = `[data-source="${CSS.escape(state.current.source)}"][data-id="${CSS.escape(state.current.id)}"]`;
@@ -776,11 +832,16 @@ async function syncAll() {
 
 // POST to a sync endpoint, then consume its SSE progress stream, driving the
 // shared progress-bar overlay. Resolves with the job's result summary.
-async function runSyncJob(postUrl, title) {
+// `opts.body` = a File/Blob (raw upload, e.g. import); `opts.json` = a JSON
+// payload (e.g. batch keys).
+async function runSyncJob(postUrl, title, opts = {}) {
   const bar = showProgress(title);
   let job;
   try {
-    job = await (await fetch(postUrl, { method: "POST" })).json();
+    const init = { method: "POST" };
+    if (opts.body) init.body = opts.body;
+    else if (opts.json) { init.body = JSON.stringify(opts.json); init.headers = { "Content-Type": "application/json" }; }
+    job = await (await fetch(postUrl, init)).json();
   } catch (err) {
     bar.fail("could not start sync: " + err.message);
     throw err;
@@ -853,6 +914,57 @@ function showProgress(title) {
   };
 }
 
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+}
+
+// Filter the session list to one provenance category and switch to the mode
+// that shows it (deleted -> archive; archived -> all). Drives the landing's
+// clickable stats + the "deleted" quick view.
+function showArchiveCategory(kind, source) {
+  state.archiveFilterKind = kind;      // "deleted" | "source" | null
+  state.archiveFilterSource = source || null;
+  const target = kind === "deleted" ? "archive" : "all";
+  if (target === state.mode) resetAndLoad();   // mode unchanged -> reload manually
+  else setMode(target);                        // setMode reloads
+}
+
+// Deselect the open session and return the right panel to the mode's home
+// (archive landing for archive mode, the empty reader otherwise). No-op on the
+// stats view. Used by the rail "clear" button and by mode switches.
+function deselectSession() {
+  if (isStatsOpen()) return;
+  if (state.current) {
+    state.current = null;
+    markActiveRow();
+    $("#transcript").hidden = true;
+    history.replaceState(null, "", location.pathname);
+  }
+  if (state.mode === "archive") showArchiveLanding();
+  else showEmptyReader();
+}
+
+// Show the rail "clear" button only when a session is selected.
+function updateClearSelection() {
+  const btn = $("#clear-selection");
+  if (btn) btn.hidden = !state.current;
+}
+
+// The default empty reader (live/all mode with nothing open).
+function showEmptyReader() {
+  $("#transcript").hidden = true;
+  $("#stats").hidden = true;
+  const empty = $("#empty");
+  empty.hidden = false;
+  empty.replaceChildren(
+    el("img", { class: "empty-icon", src: "/favicon.svg", width: "112", height: "112", alt: "scrollback" }),
+    el("p", {}, "Pick a session on the left, or search to dig through everything."),
+    el("p", { class: "empty-sub" }, "Reading is local; scrollback never writes to your agents."));
+}
+
 // The archive landing view (shown in Archive mode with nothing open).
 async function showArchiveLanding() {
   state.current = null;
@@ -871,31 +983,121 @@ async function showArchiveLanding() {
     empty.replaceChildren(el("p", {}, "could not load archive: " + err.message));
     return;
   }
+
+  // Onboarding: no vault yet.
   if (!data.exists) {
-    empty.replaceChildren(
-      el("img", { class: "empty-icon", src: "/favicon.svg", width: "96", height: "96", alt: "" }),
-      el("p", {}, "No durable archive yet."),
+    empty.replaceChildren(el("div", { class: "archive-landing archive-empty" },
+      el("img", { class: "empty-icon", src: "/favicon.svg", width: "88", height: "88", alt: "" }),
+      el("h1", {}, "Keep your sessions forever"),
       el("p", { class: "empty-sub" },
-        "Run ", el("code", {}, "scrollback archive"), " (or click below) to keep your sessions forever."),
-      el("button", { class: "btn arc-btn",
-        title: "Archive every live session into your durable vault",
-        onclick: () => syncAll() }, "Sync all now"));
+        "Your agents delete old sessions (Claude Code prunes after ~30 days). "
+        + "Archive copies them into a durable vault at ", el("code", {}, data.path),
+        " \u2014 lossless, and yours to keep."),
+      el("div", { class: "archive-actions" },
+        el("button", { class: "btn arc-btn arc-primary",
+          title: "Copy every live session into your durable vault",
+          onclick: () => syncAll() }, "\u2b07 Archive all sessions now"),
+        importButton())));
     return;
   }
-  const perSource = Object.entries(data.per_source || {})
-    .map(([k, v]) => el("li", {}, `${k}: ${v}`));
-  empty.replaceChildren(
-    el("div", { class: "archive-landing" },
-      el("h1", {}, "Your archive"),
-      el("p", { class: "empty-sub" }, data.path),
-      el("div", { class: "archive-stat-row" },
-        el("div", { class: "archive-stat" }, el("b", {}, String(data.sessions)), " sessions kept"),
-        el("div", { class: "archive-stat" }, el("b", {}, String(data.orphans)),
-          " no longer live", helpIcon("Kept in your archive but deleted from their agent."))),
-      perSource.length ? el("ul", { class: "archive-sources" }, ...perSource) : null,
-      el("button", { class: "btn arc-btn",
-        title: "Archive every live session into your durable vault",
-        onclick: () => syncAll() }, "Sync all now")));
+
+  // Populated vault: stat cards (clickable) + integrity + actions.
+  const card = (n, label, opts = {}) => el("button", {
+    class: "archive-card" + (opts.accent ? " archive-card-" + opts.accent : "")
+      + (opts.onclick ? " archive-card-clickable" : ""),
+    disabled: opts.onclick ? undefined : "disabled",
+    title: opts.title || "",
+    onclick: opts.onclick,
+  }, el("b", {}, String(n)), el("span", {}, label),
+     opts.help ? helpIcon(opts.help) : null);
+
+  const cards = el("div", { class: "archive-cards" },
+    card(data.sessions, "sessions kept", {
+      title: "Browse everything in your archive", onclick: () => showArchiveCategory(null) }),
+    card(data.orphans, "deleted from agent", {
+      accent: "deleted",
+      help: "Kept in your archive but removed from their agent \u2014 you'd have lost these.",
+      title: "Show only sessions your agents have deleted",
+      onclick: data.orphans ? () => showArchiveCategory("deleted") : null }),
+    card(data.stale, "need updating", {
+      accent: "stale",
+      help: "Archived, but the live session has newer messages since.",
+      title: "Update every stale archived session",
+      onclick: data.stale ? () => updateAllStale() : null }));
+
+  // Per-source breakdown, each row clickable to filter.
+  const perSource = Object.entries(data.per_source || {}).map(([src, n]) =>
+    el("button", { class: "archive-source-row",
+      title: `Show archived ${SRC_LABEL[src] || src} sessions`,
+      onclick: () => showArchiveCategory("source", src) },
+      el("span", { class: "src", style: `--src:${srcColor(src)}` }, SRC_LABEL[src] || src),
+      el("span", { class: "archive-source-n" }, `${n}`)));
+
+  const integrity = el("div", { class: "archive-integrity" },
+    el("span", { class: "loading-inline" }, "checking integrity\u2026"));
+  verifyInto(integrity);
+
+  empty.replaceChildren(el("div", { class: "archive-landing" },
+    el("h1", {}, "Your archive"),
+    el("p", { class: "empty-sub archive-path" }, data.path,
+      el("span", { class: "archive-size" }, "  \u00b7  " + fmtBytes(data.bytes))),
+    cards,
+    perSource.length ? el("div", { class: "archive-sources-block" },
+      el("div", { class: "archive-sub-label" }, "by source"),
+      el("div", { class: "archive-sources" }, ...perSource)) : null,
+    integrity,
+    el("div", { class: "archive-actions" },
+      el("button", { class: "btn arc-btn arc-primary",
+        title: "Archive every live session (adds new + updates changed)",
+        onclick: () => syncAll() }, "\u2b07 Archive all"),
+      data.stale ? el("button", { class: "btn arc-btn",
+        title: "Update the archived copies that have newer messages",
+        onclick: () => updateAllStale() }, `Update ${data.stale} stale`) : null,
+      el("a", { class: "btn", href: "/api/archive/export", download: "scrollback-archive.zip",
+        title: "Download the whole vault as a .zip backup (re-importable)" },
+        "\u2b07 Export .zip"),
+      importButton())));
+}
+
+// A file-picker button that uploads a vault .zip and merges it in.
+function importButton() {
+  const input = el("input", { type: "file", accept: ".zip", hidden: true,
+    onchange: (e) => { const f = e.target.files[0]; if (f) importVault(f); } });
+  const btn = el("button", { class: "btn",
+    title: "Merge a vault .zip from another machine (larger/newer copy wins)",
+    onclick: () => input.click() }, "\u2b06 Import .zip");
+  return el("span", { class: "import-wrap" }, btn, input);
+}
+
+async function importVault(file) {
+  await runSyncJob("/api/archive/import", `Merging ${file.name}\u2026`, { body: file });
+  showArchiveLanding();
+  resetAndLoad();
+}
+
+async function updateAllStale() {
+  await runSyncJob("/api/archive/sync/stale", "Updating stale sessions\u2026");
+  if (state.mode === "archive" && !state.current) showArchiveLanding();
+  resetAndLoad();
+}
+
+// Fill an element with the integrity summary (ok / missing / unreadable).
+async function verifyInto(node) {
+  let v;
+  try { v = await getJSON("/api/archive/verify"); }
+  catch { node.replaceChildren(el("span", {}, "integrity: unavailable")); return; }
+  if (!v.exists) { node.replaceChildren(); return; }
+  const bad = v.missing.length + v.unreadable.length;
+  if (!bad) {
+    node.className = "archive-integrity ok";
+    node.replaceChildren(el("span", {}, `\u2713 integrity: all ${v.ok} files OK`));
+  } else {
+    node.className = "archive-integrity bad";
+    node.replaceChildren(el("span", {},
+      `\u26a0 integrity: ${bad} problem${bad === 1 ? "" : "s"} `),
+      helpIcon(`${v.missing.length} missing file(s), ${v.unreadable.length} unreadable. `
+        + "Run 'scrollback archive --verify' for the list."));
+  }
 }
 
 // ====================================================================
@@ -1677,6 +1879,8 @@ scopeContentsBtn.addEventListener("click", () => toggleScope("contents"));
 $("#view-browse").addEventListener("click", showBrowse);
 $("#view-stats").addEventListener("click", openStats);
 $("#sync-all").addEventListener("click", () => syncAll());
+$("#archive-matching").addEventListener("click", archiveMatching);
+$("#clear-selection").addEventListener("click", deselectSession);
 $("#rail-toggle").addEventListener("click", toggleRail);
 $("#rail-backdrop").addEventListener("click", closeRail);
 $("#about-btn").addEventListener("click", openAbout);
