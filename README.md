@@ -367,12 +367,21 @@ window closes. All of this behaviour is decided in Python, so the launcher
 scripts stay free of OS-specific assumptions and ship inside the package
 for `pip install` users.
 
-To clean up, `scrollback uninstall` removes the artifacts scrollback
-created — the launchers, the macOS `.app`, the optional search index, and the
-launcher log — after a confirmation (`--yes` to skip it, `--dry-run` to
-preview). It never touches your agent data, and it does not remove the Python
-package itself: it prints the right `pip`/`pipx uninstall` command to finish
-the job (a program can't reliably uninstall the package it is running from).
+To see exactly what scrollback has put on disk, run `scrollback doctor` — its
+**on-disk footprint** section lists every file scrollback created (search
+index, web-app browser profile, cache dir, launchers, macOS `.app`, launcher
+log, and your archive vault), each tagged by tier and size. Your agent data is
+never in that list — scrollback only reads it.
+
+To clean up, `scrollback uninstall` removes that whole footprint — everything
+except your **durable archive vault**, which is kept by default (it's your
+data) — after a confirmation (`--yes` to skip it, `--dry-run` to preview). To
+also delete the vault, pass `--purge-archive`; scrollback then tells you how
+many kept sessions will be lost, suggests backing up first with
+`scrollback archive --export <dest>`, and requires you to type a confirmation.
+Uninstall never touches your agent data and does not remove the Python package
+itself: it prints the right `pip`/`pipx uninstall` command to finish the job (a
+program can't reliably uninstall the package it is running from).
 
 ## Fast search (optional index)
 

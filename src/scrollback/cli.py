@@ -152,9 +152,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  full-text search (FTS5): {'yes' if fts.fts5_available() else 'no'}")
     index = fts.FtsIndex()
     if index.exists():
-        s = index.stats()
-        stale = "stale" if index.is_stale(store) else "fresh"
-        print(f"  search index: built ({s['sessions']} sessions, {s['parts']} parts, {stale})")
+        try:
+            s = index.stats()
+            stale = "stale" if index.is_stale(store) else "fresh"
+            print(f"  search index: built ({s['sessions']} sessions, {s['parts']} parts, {stale})")
+        except sqlite3.Error:
+            # A malformed/old index shouldn't crash the diagnostics command.
+            print("  search index: present but unreadable (rebuild: 'scrollback index --clear')")
         print(f"                {index.path}")
     else:
         print("  search index: not built (run 'scrollback index' for faster search)")
@@ -171,8 +175,38 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  native window (pywebview): {'yes' if _pywebview_available() else 'no'}")
     print(f"  rich terminal output: {'yes' if _rich_available() else 'no'}")
     print(f"  web app (fastapi/uvicorn): {'yes' if _web_available() else 'no'}")
+    print()
+
+    # -- on-disk footprint: everything scrollback created, so nothing is a
+    #    surprise. Agent data is never listed (scrollback only reads it).
+    from . import launcher_install
+
+    print("on-disk footprint (scrollback's own files; your agent data is never here):")
+    entries = launcher_install.footprint()
+    if not entries:
+        print("  (nothing created yet)")
+    else:
+        _TIER = {"disposable": "disposable", "artifact": "installed", "durable": "DURABLE"}
+        for e in entries:
+            size = launcher_install._dir_size(e.path)
+            print(f"  [{_TIER[e.tier]:10}] {_fmt_bytes(size):>8}  {e.path}")
+            print(f"               {e.description}")
+        print("  disposable + installed are removed by 'scrollback uninstall';")
+        print("  DURABLE (your archive) is kept unless you pass --purge-archive.")
 
     return 0 if any_avail else 1
+
+
+def _fmt_bytes(n: int) -> str:
+    if not n:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    f = float(n)
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024
+        i += 1
+    return f"{f:.1f} {units[i]}" if i else f"{int(f)} B"
 
 
 def _rich_available() -> bool:
@@ -1071,33 +1105,40 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     data, and it never tries to uninstall the Python package -- that is left
     to pip/pipx, with the exact command printed at the end.
     """
-    from . import archive, fts, launcher_install
+    from . import archive, launcher_install
 
-    targets: list = list(launcher_install.installed_artifacts())
-    index_path = fts.default_index_path()
-    if index_path.exists():
-        targets.append(index_path)
+    entries = launcher_install.footprint()
+    # Remove disposable (cache/index/browser) + installed artifacts by default.
+    # The durable vault is user data: kept unless --purge-archive.
+    removable = [e for e in entries if e.tier in ("disposable", "artifact")]
+    vault_entry = next((e for e in entries if e.tier == "durable"), None)
+    purge_vault = bool(getattr(args, "purge_archive", False)) and vault_entry is not None
 
-    # The durable archive vault is user-owned data: kept by default, removed
-    # only when --purge-archive is given (and then listed distinctly below).
-    vault = archive.ArchiveStore()
-    purge_vault = getattr(args, "purge_archive", False) and vault.path.exists()
-    if vault.path.exists() and not purge_vault:
-        _eprint(f"keeping durable archive vault (use --purge-archive to remove): "
-                f"{vault.path}")
+    if vault_entry is not None and not purge_vault:
+        _eprint(f"keeping your durable archive vault ({vault_entry.path}).")
+        _eprint("  it holds sessions you chose to keep; pass --purge-archive to remove it.")
 
-    if not targets and not purge_vault:
-        _eprint("no scrollback-created artifacts found.")
+    if not removable and not purge_vault:
+        _eprint("no scrollback-created files to remove.")
         _eprint(f"to remove the package itself, run:\n    {_detect_install_tool()}")
         return 0
 
     label = "would remove" if args.dry_run else "about to remove"
     _eprint(f"{label}:")
-    for p in targets:
-        _eprint(f"  {p}")
+    for e in removable:
+        _eprint(f"  {e.path}   ({e.description})")
+
+    targets = [e.path for e in removable]
+
     if purge_vault:
-        _eprint(f"  {vault.path}  (durable archive -- will be PERMANENTLY deleted)")
-        targets.append(vault.path)
+        # Extra caution for durable data: state the loss, suggest a backup.
+        vault = archive.ArchiveStore()
+        n = vault.stats().get("sessions", 0) if vault.exists() else 0
+        _eprint("")
+        _eprint(f"  {vault_entry.path}")
+        _eprint(f"  \u26a0 DURABLE ARCHIVE -- {n} kept session(s) will be PERMANENTLY deleted.")
+        _eprint("    Back up first with:  scrollback archive --export <dest>")
+        targets.append(vault_entry.path)
 
     if args.dry_run:
         return 0
@@ -1111,8 +1152,24 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             _eprint("aborted; nothing removed.")
             return 1
 
+    # Purging the vault is irreversible: require typing the word, even with -y.
+    if purge_vault:
+        try:
+            confirm = input(
+                "type 'delete archive' to confirm permanent deletion of your vault: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            confirm = ""
+        if confirm != "delete archive":
+            _eprint("archive NOT deleted (confirmation did not match).")
+            targets = [p for p in targets if p != vault_entry.path]
+
+    # Remove deepest paths first so a child (e.g. the index / browser profile)
+    # is gone before its parent cache dir; skip anything already removed.
     removed, failed = 0, 0
-    for p in targets:
+    for p in sorted(targets, key=lambda x: len(str(x)), reverse=True):
+        if not p.exists():
+            continue
         try:
             launcher_install.remove_path(p)
             _eprint(f"removed {p}")
@@ -1427,13 +1484,15 @@ def build_parser() -> argparse.ArgumentParser:
     # uninstall
     sp = sub.add_parser(
         "uninstall",
-        help="remove scrollback-created artifacts (launchers, app, index)",
-        description="Remove files scrollback created (Desktop launcher, macOS "
-                    ".app, search index, launcher log). Your agent data is never "
+        help="remove scrollback-created files (see 'doctor' for the full list)",
+        description="Remove every file scrollback created (search index, "
+                    "web-app browser profile, cache dir, Desktop launcher, "
+                    "macOS .app, launcher log) -- the same footprint "
+                    "'scrollback doctor' lists. Your agent data is never "
                     "touched, and the durable archive vault is kept unless "
-                    "--purge-archive is given. The Python package itself is "
-                    "removed with pip/pipx -- the exact command is printed at "
-                    "the end.",
+                    "--purge-archive is given (which asks for a typed "
+                    "confirmation). The Python package itself is removed with "
+                    "pip/pipx -- the exact command is printed at the end.",
     )
     sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     sp.add_argument("--dry-run", action="store_true",

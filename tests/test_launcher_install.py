@@ -125,3 +125,46 @@ def test_installed_artifacts_empty_when_nothing_installed(tmp_path, monkeypatch)
     monkeypatch.setattr(launcher_install.Path, "home", classmethod(lambda cls: tmp_path))
     (tmp_path / "Desktop").mkdir()
     assert launcher_install.installed_artifacts() == []
+
+
+# -- footprint model --------------------------------------------------------
+
+
+def _isolate_home(tmp_path, monkeypatch):
+    """Point every scrollback path (home, index, vault) at a temp home."""
+    monkeypatch.setattr(launcher_install.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("SCROLLBACK_INDEX", str(tmp_path / ".cache" / "scrollback" / "index.db"))
+    monkeypatch.setenv("SCROLLBACK_ARCHIVE", str(tmp_path / ".scrollback" / "archive"))
+    (tmp_path / "Desktop").mkdir(exist_ok=True)
+
+
+def test_footprint_empty_when_nothing_created(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    assert launcher_install.footprint() == []
+
+
+def test_footprint_catches_browser_profile_and_index(tmp_path, monkeypatch):
+    """The browser profile (the ghost the old uninstall missed) is tracked."""
+    _isolate_home(tmp_path, monkeypatch)
+    cache = tmp_path / ".cache" / "scrollback"
+    (cache / "browser").mkdir(parents=True)
+    (cache / "browser" / "prefs").write_text("{}")
+    (cache / "index.db").write_text("idx")
+
+    fp = {e.path: e.tier for e in launcher_install.footprint()}
+    assert cache / "browser" in fp and fp[cache / "browser"] == "disposable"
+    assert cache / "index.db" in fp and fp[cache / "index.db"] == "disposable"
+    assert cache in fp  # parent cache dir tracked too
+
+
+def test_footprint_tags_vault_durable(tmp_path, monkeypatch):
+    _isolate_home(tmp_path, monkeypatch)
+    from scrollback.archive import ArchiveStore
+    from scrollback.store import Store
+    from tests.test_archive import FakeSource, _session
+
+    ArchiveStore(tmp_path / ".scrollback" / "archive").sync(
+        Store([FakeSource([_session("s1")])]))
+    durable = [e for e in launcher_install.footprint() if e.tier == "durable"]
+    assert len(durable) == 1
+    assert "archive" in str(durable[0].path)

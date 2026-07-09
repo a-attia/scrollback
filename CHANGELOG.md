@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **On-disk footprint visibility + complete uninstall.** `scrollback doctor`
+  now lists every file scrollback created — search index, web-app browser
+  profile, cache dir, launchers, macOS `.app`, launcher log, and the archive
+  vault — each tagged by tier (disposable / installed / durable) with its size,
+  so there are no ghost files you're unaware of. `scrollback uninstall` is
+  driven by that same footprint, so it now also removes the web-app **browser
+  profile** and cache directory (previously left behind). The durable archive
+  vault is still kept unless `--purge-archive`, which now reports how many kept
+  sessions will be lost, suggests `scrollback archive --export` first, and
+  requires a typed confirmation.
+
+### Fixed
+
+- `scrollback doctor` no longer crashes on a malformed/old search index (it
+  reports it as unreadable and suggests a rebuild).
+
 ## [0.4.0] - 2026-07-09
 
 Durable session archive: keep your AI-agent sessions forever, browse and

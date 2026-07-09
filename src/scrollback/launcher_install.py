@@ -21,6 +21,7 @@ import os
 import shlex
 import stat
 import sys
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
@@ -247,3 +248,80 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
     else:
         path.unlink()
+
+
+# -- unified on-disk footprint --------------------------------------------
+
+@dataclass(frozen=True)
+class FootprintEntry:
+    """One thing scrollback created on disk, tagged by tier.
+
+    tier:
+      * ``disposable`` -- derived/cache; safe to delete, rebuilt on demand
+        (search index, browser profile). Removed by `uninstall`.
+      * ``artifact``   -- things `install-launcher` created (Desktop launcher,
+        .app bundle, launcher log, Linux .desktop). Removed by `uninstall`.
+      * ``durable``    -- user-owned data (the archive vault). KEPT by
+        `uninstall` unless `--purge-archive`.
+    """
+
+    path: Path
+    tier: str
+    description: str
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def footprint() -> list[FootprintEntry]:
+    """Every path scrollback may have created on this machine, tagged by tier.
+
+    The single source of truth consumed by `doctor` (visibility) and
+    `uninstall` (what to remove). Only existing paths are returned. NEVER
+    includes the user's agent data (opencode / Claude Code / ...), which
+    scrollback only ever reads.
+    """
+    from . import fts
+
+    entries: list[FootprintEntry] = []
+
+    # disposable: search index + browser profile, and the cache dir that holds
+    # them. The index path may be relocated via $SCROLLBACK_INDEX; the browser
+    # profile lives under the standard cache dir.
+    index = fts.default_index_path()
+    if index.exists():
+        entries.append(FootprintEntry(index, "disposable", "search index (rebuilt on demand)"))
+    cache_dir = Path.home() / ".cache" / "scrollback"
+    browser = cache_dir / "browser"
+    if browser.exists():
+        entries.append(FootprintEntry(browser, "disposable", "web-app browser profile"))
+    # The cache parent, listed last so it is removed after its contents. Only
+    # when it is the standard dir (a relocated index lives elsewhere).
+    if cache_dir.exists():
+        entries.append(FootprintEntry(cache_dir, "disposable", "cache directory"))
+
+    # artifacts: launchers / app / log (existing enumeration)
+    for p in installed_artifacts():
+        entries.append(FootprintEntry(p, "artifact", "launcher / app / log"))
+
+    # durable: the archive vault
+    from . import archive
+
+    vault = archive.default_archive_path()
+    if vault.exists():
+        entries.append(FootprintEntry(vault, "durable", "durable archive vault (your kept sessions)"))
+
+    return entries
