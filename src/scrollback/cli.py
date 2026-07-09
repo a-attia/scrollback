@@ -158,6 +158,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"                {index.path}")
     else:
         print("  search index: not built (run 'scrollback index' for faster search)")
+    from . import archive
+
+    vault = archive.ArchiveStore()
+    if vault.exists():
+        vs = vault.stats()
+        print(f"  archive vault: {vs['sessions']} sessions "
+              f"({vs['orphans']} no longer live)")
+        print(f"                 {vault.path}")
+    else:
+        print("  archive vault: none (run 'scrollback archive' to keep sessions forever)")
     print(f"  native window (pywebview): {'yes' if _pywebview_available() else 'no'}")
     print(f"  rich terminal output: {'yes' if _rich_available() else 'no'}")
     print(f"  web app (fastapi/uvicorn): {'yes' if _web_available() else 'no'}")
@@ -358,6 +368,107 @@ def cmd_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_archive(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from . import archive
+
+    dest = Path(args.dest).expanduser() if args.dest else archive.default_archive_path()
+    store = archive.ArchiveStore(dest)
+
+    if args.stats:
+        if not store.exists():
+            _eprint(f"no archive at {store.path}; run 'scrollback archive' to create one")
+            return 1
+        s = store.stats()
+        print(f"archive: {store.path}")
+        print(f"sessions: {s['sessions']}   no longer live: {s['orphans']}")
+        for src, n in sorted(s.get("per_source", {}).items()):
+            print(f"  {src:12} {n}")
+        print()
+        print("layout (durable, user-owned; survives 'uninstall'):")
+        print(f"  {store.path}/")
+        print("  ├── manifest.sqlite      index: (source,id) -> signature, path")
+        print("  └── sessions/<source>/<id>.json   one lossless JSON per session")
+        print("back up or move to another machine with:")
+        print("  scrollback archive --export <dest>            (copy the vault)")
+        print("  scrollback archive --export bundle.zip        (zip it)")
+        return 0
+
+    if args.verify:
+        if not store.exists():
+            _eprint(f"no archive at {store.path}; nothing to verify")
+            return 1
+        v = store.verify()
+        print(f"archive: {store.path}")
+        print(f"ok: {len(v['ok'])}   missing: {len(v['missing'])}   "
+              f"unreadable: {len(v['unreadable'])}")
+        for label in v["missing"]:
+            _eprint(f"  missing file: {label}")
+        for label in v["unreadable"]:
+            _eprint(f"  unreadable:   {label}")
+        return 0 if not v["missing"] and not v["unreadable"] else 1
+
+    if args.export:
+        if not store.exists():
+            _eprint(f"no archive at {store.path}; nothing to export")
+            return 1
+        fmt = args.format
+        try:
+            r = store.export_to(args.export, fmt=fmt, doc_format=args.doc_format)
+        except FileExistsError as exc:
+            _eprint(str(exc))
+            return 1
+        if fmt == "vault":
+            _eprint(f"exported {r['sessions']} sessions -> {r['dest']}")
+            _eprint("this is a full, re-importable copy of your vault. To use it:")
+            _eprint(f"    SCROLLBACK_ARCHIVE={r['dest']} scrollback archive --stats")
+        else:
+            _eprint(f"rendered {r['sessions']} sessions ({args.doc_format}) -> {r['dest']}")
+            _eprint("note: rendered transcripts are for reading/sharing, not a backup "
+                    "(cannot be re-imported as a vault).")
+        return 0
+
+    if getattr(args, "import_from", None):
+        _eprint(f"merging {args.import_from} into {store.path} ...")
+
+        def iprogress(done: int, total: int) -> None:
+            if done == total or done % 25 == 0:
+                _eprint(f"  {done}/{total} sessions")
+
+        try:
+            r = store.import_from(args.import_from, progress=iprogress)
+        except FileNotFoundError as exc:
+            _eprint(str(exc))
+            return 1
+        msg = (f"done: +{r['added']} added, {r['updated']} updated, "
+               f"{r['unchanged']} unchanged")
+        if r["kept_shrunk"]:
+            msg += f", {r['kept_shrunk']} kept (skipped shrunk)"
+        _eprint(msg)
+        return 0
+
+    live = _make_store(args)
+    if not live.sources:
+        _eprint("no sources available to archive")
+        return 1
+    _eprint(f"archiving to {store.path} ...")
+
+    def progress(done: int, total: int) -> None:
+        if done == total or done % 25 == 0:
+            _eprint(f"  {done}/{total} sessions")
+
+    r = store.sync(live, progress=progress)
+    msg = (
+        f"done: +{r['added']} added, {r['updated']} updated, "
+        f"{r['unchanged']} unchanged, {r['kept_orphan']} kept (no longer live)"
+    )
+    if r["kept_shrunk"]:
+        msg += f", {r['kept_shrunk']} kept (skipped shrunk read)"
+    _eprint(msg)
+    return 0
+
+
 class _BadSource(Exception):
     """Raised when an unknown --source name is given."""
 
@@ -366,12 +477,20 @@ def _make_store(args: argparse.Namespace) -> Store:
     store = Store()
     name = getattr(args, "source", None)
     if name:
-        known = {s.name for s in registry.all_sources()}
+        known = {s.name for s in registry.all_sources()} | {"archive"}
         if name not in known:
             raise _BadSource(
                 f"unknown source {name!r}; available: {', '.join(sorted(known))}"
             )
-        store = store.with_sources([name])
+        # "archive" is not a live adapter; with_sources([]) drops live sources
+        # and the archive reader is added below, giving an archive-only view.
+        store = store.with_sources([] if name == "archive" else [name])
+    # Make archived sessions -- including ones the agent has deleted -- a
+    # first-class readable source when a vault exists (no-op otherwise).
+    # Deduped live-wins, so this never changes what a live session shows.
+    from . import archive
+
+    store = store.with_archive(archive.default_archive_path())
     return store
 
 
@@ -952,14 +1071,22 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     data, and it never tries to uninstall the Python package -- that is left
     to pip/pipx, with the exact command printed at the end.
     """
-    from . import fts, launcher_install
+    from . import archive, fts, launcher_install
 
     targets: list = list(launcher_install.installed_artifacts())
     index_path = fts.default_index_path()
     if index_path.exists():
         targets.append(index_path)
 
-    if not targets:
+    # The durable archive vault is user-owned data: kept by default, removed
+    # only when --purge-archive is given (and then listed distinctly below).
+    vault = archive.ArchiveStore()
+    purge_vault = getattr(args, "purge_archive", False) and vault.path.exists()
+    if vault.path.exists() and not purge_vault:
+        _eprint(f"keeping durable archive vault (use --purge-archive to remove): "
+                f"{vault.path}")
+
+    if not targets and not purge_vault:
         _eprint("no scrollback-created artifacts found.")
         _eprint(f"to remove the package itself, run:\n    {_detect_install_tool()}")
         return 0
@@ -968,6 +1095,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     _eprint(f"{label}:")
     for p in targets:
         _eprint(f"  {p}")
+    if purge_vault:
+        _eprint(f"  {vault.path}  (durable archive -- will be PERMANENTLY deleted)")
+        targets.append(vault.path)
 
     if args.dry_run:
         return 0
@@ -1130,6 +1260,37 @@ def build_parser() -> argparse.ArgumentParser:
     def add_source_flag(sp_: argparse.ArgumentParser) -> None:
         sp_.add_argument("--source", help="restrict to one source (e.g. opencode)")
 
+    # archive
+    sp = sub.add_parser(
+        "archive",
+        help="copy sessions into a durable local vault (kept forever)",
+        description="Incrementally copy the sessions scrollback reads into a "
+                    "user-owned vault that survives the agents' own auto-"
+                    "deletion. One-way and lossless; your agent data is never "
+                    "modified. Default vault: ~/.scrollback/archive "
+                    "(override with --dest or $SCROLLBACK_ARCHIVE).",
+    )
+    add_source_flag(sp)
+    sp.add_argument("--dest", help="vault path (default: ~/.scrollback/archive)")
+    sp.add_argument("--stats", action="store_true",
+                    help="show vault stats + layout and exit (no sync)")
+    sp.add_argument("--verify", action="store_true",
+                    help="check archived files exist and parse; exit (no sync)")
+    sp.add_argument("--export", metavar="DEST",
+                    help="export the vault for backup / another machine, to a "
+                         "directory or a .zip (no sync)")
+    sp.add_argument("--import", dest="import_from", metavar="VAULT",
+                    help="merge another vault (directory or .zip, e.g. one made "
+                         "with --export on another machine) into this one; "
+                         "larger/newer copy wins, never loses messages (no sync)")
+    sp.add_argument("--format", choices=["vault", "rendered"], default="vault",
+                    help="export format: 'vault' (faithful, re-importable copy; "
+                         "default) or 'rendered' (readable transcripts, not a backup)")
+    sp.add_argument("--doc-format", dest="doc_format", default="markdown",
+                    choices=["markdown", "html", "json", "text"],
+                    help="document format when --format rendered (default markdown)")
+    sp.set_defaults(func=cmd_archive)
+
     # list
     sp = sub.add_parser("list", help="list sessions (newest first)")
     add_source_flag(sp)
@@ -1269,12 +1430,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="remove scrollback-created artifacts (launchers, app, index)",
         description="Remove files scrollback created (Desktop launcher, macOS "
                     ".app, search index, launcher log). Your agent data is never "
-                    "touched. The Python package itself is removed with pip/pipx "
-                    "-- the exact command is printed at the end.",
+                    "touched, and the durable archive vault is kept unless "
+                    "--purge-archive is given. The Python package itself is "
+                    "removed with pip/pipx -- the exact command is printed at "
+                    "the end.",
     )
     sp.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt")
     sp.add_argument("--dry-run", action="store_true",
                     help="show what would be removed, then exit")
+    sp.add_argument("--purge-archive", action="store_true",
+                    help="also permanently delete the durable archive vault "
+                         "(kept by default -- it is your data)")
     sp.set_defaults(func=cmd_uninstall)
 
     return p
