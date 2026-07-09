@@ -182,6 +182,75 @@ def demo_store() -> Store:
     return Store([DemoSource()])
 
 
+def _extra_archived_session() -> Session:
+    """A session that will be archived then 'deleted from its agent' -- to
+    demonstrate the deleted (archive-only) provenance tag in the archive UI."""
+    msgs = (
+        _msg("d-u1", "user", 0, _text("d-p1",
+            "Draft release notes for v0.4.0.")),
+        _msg("d-a1", "assistant", 1, _text("d-p2",
+            "Here are the highlights: durable archive, Live/Archive/All web "
+            "modes, export/import for backup and cross-machine sync.")),
+    )
+    return Session(
+        id="ses_demo_release_notes_0004", source="opencode",
+        title="Draft release notes for v0.4.0",
+        directory="~/projects/scrollback", created=_dt(-3000), updated=_dt(-2990),
+        model="claude-sonnet", agent="build",
+        message_count=len(msgs), cost=0.004,
+        tokens_input=320, tokens_output=260, messages=msgs,
+    )
+
+
+class _ListSource(Source):
+    """A minimal in-memory source over an explicit session list (for building a
+    demo vault whose live set we control)."""
+
+    name = "opencode"
+    label = "demo"
+
+    def __init__(self, sessions: list[Session]) -> None:
+        self._sessions = {s.id: s for s in sessions}
+
+    def is_available(self) -> bool:
+        return True
+
+    def location(self) -> Path | None:
+        return Path("/demo")
+
+    def list_sessions(self) -> Iterator[Session]:
+        return iter(self._sessions.values())
+
+    def load_session(self, session_id: str) -> Session | None:
+        return self._sessions.get(session_id)
+
+
+def build_demo_archive(vault_path: Path):
+    """Build a synthetic archive vault on disk that exercises every provenance
+    state for screenshots: archived-and-live, deleted-from-agent, and stale.
+
+    Returns a `Store` over the live demo sources + the vault (the "all" store),
+    so the web app shows Live/Archive/All with realistic tags + landing counts.
+    """
+    from dataclasses import replace
+
+    from scrollback.archive import ArchiveStore
+
+    live = demo_sessions()                      # 3 live sessions
+    extra = _extra_archived_session()           # will become deleted-only
+
+    vault = ArchiveStore(vault_path)
+    # Archive all 3 live + the extra.
+    vault.sync(Store([_ListSource([*live, extra])]))
+    # Make one live session STALE: bump its updated + message_count so the live
+    # copy is newer than the archived one.
+    stale = replace(live[0], updated=_dt(30),
+                    message_count=(live[0].message_count or 0) + 2)
+    live_after = [stale, live[1], live[2]]      # `extra` dropped -> deleted-only
+
+    return Store([_ListSource(live_after)]).with_archive(vault_path)
+
+
 if __name__ == "__main__":
     # Quick manual check: print a one-line summary of the demo corpus.
     for s in demo_sessions():

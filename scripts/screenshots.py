@@ -24,7 +24,7 @@ from pathlib import Path
 # Make `scripts/` importable when run from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from demo_data import demo_sessions, demo_store  # noqa: E402
+from demo_data import build_demo_archive, demo_sessions, demo_store  # noqa: E402
 
 OUT = Path(__file__).resolve().parent.parent / "assets" / "screenshots"
 OUT.mkdir(parents=True, exist_ok=True)
@@ -120,12 +120,13 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _serve(port: int):
+def _serve(port: int, store=None, archive_path=None):
     import uvicorn
 
     from scrollback.web.app import create_app
 
-    app = create_app(demo_store(), allowed_hosts=[])
+    app = create_app(store if store is not None else demo_store(),
+                     allowed_hosts=[], archive_path=archive_path)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
                                             log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
@@ -171,16 +172,59 @@ def render_web_png() -> Path:
     return out
 
 
+def render_archive_png() -> Path:
+    """The Live / Archive / All web UI + archive landing (the 0.4.0 flagship).
+
+    Builds a synthetic vault (archived + deleted-from-agent + stale sessions),
+    serves it, switches to Archive mode, and screenshots the landing dashboard.
+    """
+    import shutil
+
+    from playwright.sync_api import sync_playwright
+
+    # Build the demo vault at a clean, realistic-looking path (shown in the
+    # screenshot) -- deliberately `.scrollback-demo`, NOT the real
+    # `~/.scrollback`, and removed afterwards.
+    tmp = Path.home() / ".scrollback-demo"
+    shutil.rmtree(tmp, ignore_errors=True)
+    vault = tmp / "archive"
+    store = build_demo_archive(vault)
+    port = _free_port()
+    server = _serve(port, store=store, archive_path=vault)
+    out = OUT / "archive.png"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={"width": 1280, "height": 720},
+                                    device_scale_factor=2)
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
+            page.evaluate("localStorage.setItem('scrollback-theme','dark')")
+            page.reload(wait_until="networkidle")
+            # Switch to Archive mode to show the landing dashboard.
+            page.click("#modeswitch .mode-btn[data-mode='archive']")
+            page.wait_for_selector(".archive-landing", timeout=5000)
+            page.wait_for_timeout(500)   # let the integrity check + cards settle
+            page.screenshot(path=str(out))
+            browser.close()
+    finally:
+        server.should_exit = True
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"wrote {out}")
+    return out
+
+
 def main() -> int:
     render_cli()
-    try:
-        render_web_png()
-    except Exception as exc:  # noqa: BLE001
-        print(f"web screenshot skipped: {exc}", file=sys.stderr)
-        print("  (install the extra + browser: pip install -e '.[screenshots]' "
-              "&& playwright install chromium)", file=sys.stderr)
-        return 1
-    return 0
+    rc = 0
+    for render in (render_web_png, render_archive_png):
+        try:
+            render()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{render.__name__} skipped: {exc}", file=sys.stderr)
+            print("  (install the extra + browser: pip install -e '.[screenshots]' "
+                  "&& playwright install chromium)", file=sys.stderr)
+            rc = 1
+    return rc
 
 
 if __name__ == "__main__":
