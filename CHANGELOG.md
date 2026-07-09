@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-09
+
 ### Fixed
 
 - **Web assets bust the cache on content change.** `style.css` / `app.js` URLs
@@ -14,24 +16,6 @@ follow [Semantic Versioning](https://semver.org/).
   stale-UI cases in the native app's WebView where an updated `app.js` (e.g.
   the search titles/contents toggle) wasn't being picked up until a full quit
   + relaunch.
-
-### Added
-
-- **On-disk footprint visibility + complete uninstall.** `scrollback doctor`
-  now lists every file scrollback created — search index, web-app browser
-  profile, cache dir, launchers, macOS `.app`, launcher log, and the archive
-  vault — each tagged by tier (disposable / installed / durable) with its size,
-  so there are no ghost files you're unaware of. `scrollback uninstall` is
-  driven by that same footprint, so it now also removes the web-app **browser
-  profile** and cache directory (previously left behind). The durable archive
-  vault is still kept unless `--purge-archive`, which now reports how many kept
-  sessions will be lost, suggests `scrollback archive --export` first, and
-  requires a typed confirmation.
-
-### Fixed
-
-- `scrollback doctor` no longer crashes on a malformed/old search index (it
-  reports it as unreadable and suggests a rebuild).
 
 ## [0.4.0] - 2026-07-09
 
@@ -74,6 +58,17 @@ manage them in the web UI, and back up / sync them across machines.
   in the transcript header; a contextual "archive these" bulk action for the
   current filter/search; a "clear selection" control; UI-wide help tooltips.
 
+- **On-disk footprint visibility + complete uninstall.** `scrollback doctor`
+  lists every file scrollback created — search index, web-app browser profile,
+  cache dir, launchers, macOS `.app`, launcher log, and the archive vault —
+  each tagged by tier (disposable / installed / durable) with its size, so
+  there are no ghost files. `scrollback uninstall` is driven by that same
+  footprint, so it now also removes the web-app **browser profile** and cache
+  directory (previously left behind); the durable vault is still kept unless
+  `--purge-archive`, which reports how many kept sessions will be lost,
+  suggests `scrollback archive --export` first, and requires a typed
+  confirmation.
+
 ### Changed
 
 - **Read-only posture, restated precisely.** scrollback still **never writes to
@@ -95,6 +90,11 @@ manage them in the web UI, and back up / sync them across machines.
   timeout, preventing manifest corruption/lock errors under concurrent syncs.
 - The never-shrink guard (a re-read with fewer messages can't overwrite a good
   archived copy) now also covers rows with an unknown message count.
+
+### Fixed
+
+- `scrollback doctor` no longer crashes on a malformed/old search index (it
+  reports it as unreadable and suggests a rebuild).
 
 ## [0.3.2] - 2026-06-30
 
