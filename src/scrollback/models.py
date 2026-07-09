@@ -36,6 +36,10 @@ def _to_dt(ms_or_iso: int | float | str | None) -> datetime | None:
     """
     if ms_or_iso is None:
         return None
+    if isinstance(ms_or_iso, datetime):
+        # Already a datetime (e.g. from dataclasses.asdict, which does not
+        # stringify datetimes). Ensure tz-awareness for consistent sorting.
+        return ms_or_iso if ms_or_iso.tzinfo else ms_or_iso.replace(tzinfo=timezone.utc)
     if isinstance(ms_or_iso, (int, float)):
         # opencode stores epoch milliseconds.
         return datetime.fromtimestamp(ms_or_iso / 1000.0, tz=timezone.utc)
@@ -75,6 +79,18 @@ class Part:
     tool_status: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Part":
+        """Reconstruct a Part from its `asdict` form (archive round-trip)."""
+        return cls(
+            id=d["id"],
+            type=d["type"],
+            text=d.get("text", "") or "",
+            tool_name=d.get("tool_name"),
+            tool_status=d.get("tool_status"),
+            raw=d.get("raw") or {},
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Message:
@@ -91,6 +107,18 @@ class Message:
     def text(self) -> str:
         """Concatenated text of all textual parts (text + reasoning)."""
         return "\n".join(p.text for p in self.parts if p.text)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Message":
+        """Reconstruct a Message (and its Parts) from its `asdict` form."""
+        return cls(
+            id=d["id"],
+            role=d["role"],
+            created=_to_dt(d.get("created")),
+            parts=tuple(Part.from_dict(p) for p in d.get("parts", ())),
+            model=d.get("model"),
+            raw=d.get("raw") or {},
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +164,34 @@ class Session:
     def is_subagent(self) -> bool:
         """True if this session was spawned by another (has a parent)."""
         return bool(self.parent_id)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Session":
+        """Reconstruct a Session (with children + messages) from its `asdict`
+        form. Inverse of `dataclasses.asdict(session)`; the missing half of
+        the archive round-trip. Computed properties (`short_id`,
+        `is_subagent`) are not stored and are recomputed on access."""
+        return cls(
+            id=d["id"],
+            source=d["source"],
+            title=d["title"],
+            directory=d.get("directory"),
+            created=_to_dt(d.get("created")),
+            updated=_to_dt(d.get("updated")),
+            model=d.get("model"),
+            agent=d.get("agent"),
+            parent_id=d.get("parent_id"),
+            message_count=d.get("message_count"),
+            cost=d.get("cost"),
+            tokens_input=d.get("tokens_input"),
+            tokens_output=d.get("tokens_output"),
+            tokens_cache_read=d.get("tokens_cache_read"),
+            tokens_cache_write=d.get("tokens_cache_write"),
+            tokens_reasoning=d.get("tokens_reasoning"),
+            children=tuple(Session.from_dict(c) for c in d.get("children", ())),
+            messages=tuple(Message.from_dict(m) for m in d.get("messages", ())),
+            raw=d.get("raw") or {},
+        )
 
 
 # Re-export the converter for adapters.

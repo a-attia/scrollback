@@ -1,8 +1,10 @@
 # Plan: Durable Session Archive ("keep sessions forever")
 
-Status: **planned** (not started). This is the design of record for the
-bulk save / archive feature. Written to be picked up in a dedicated
-implementation session. Nothing here is built yet.
+Status: **Phases 1–4 shipped** (as of 2026-07-08); Phase 5 (multi-machine /
+cloud sync) remains out of v1 scope. The five design questions are resolved
+(see [§7](#7-resolved-design-decisions)). This is the design of record for
+the durable-archive feature; it now doubles as the as-built reference. See
+the per-phase status in [§6](#6-phasing-each-phase-independently-releasable).
 
 See also: [`ROADMAP.md`](../ROADMAP.md) (index of planned work),
 [`CONTRIBUTING.md`](../CONTRIBUTING.md) (the read-only invariant and
@@ -115,13 +117,17 @@ Modeled on `FtsIndex` (`fts.py`):
   `archived(source, session_id, updated, message_count, first_archived,
   last_synced, file_path, PRIMARY KEY(source, session_id))`.
 - `sync(store, *, sources=None, progress=None) -> {"added", "updated",
-  "unchanged", "kept_orphan"}`:
+  "unchanged", "kept_orphan", "kept_shrunk"}`:
   1. Enumerate live via `store.list_sessions(fold_subagents=False)` (the
      `fts.py:133` pattern — every session incl. subagents).
   2. Signature `(updated.isoformat(), message_count)` (`fts.py:139-142`).
      Unchanged -> skip; else `load_session(id, source=...)` fully and write
      the lossless JSON + upsert the manifest.
-  3. **No prune.** Sessions in the manifest but absent from live are
+  3. **Never-shrink guard** (see [§7.3](#73-versioning-on-change--overwrite-but-never-shrink-)).
+     Before overwriting, if the freshly-loaded session has **fewer**
+     messages than the archived copy, skip the write and count it
+     `kept_shrunk` — never clobber good archived data with a degraded read.
+  4. **No prune.** Sessions in the manifest but absent from live are
      **kept** (counted `kept_orphan`) — the durability guarantee. Optionally
      record `last_seen_live` so we can report "N archived sessions no longer
      exist in their agent."
@@ -144,6 +150,15 @@ Modeled on `FtsIndex` (`fts.py`):
   "known but unavailable" chip when no vault exists.
 - **Loop-safety:** archive sync reads *live* sources only, never the
   `ArchiveSource`, so it can never archive its own archive.
+- **Dedup is cross-cutting, not free** (see [§7.2](#72-dedup-precedence--live-wins-)).
+  `Store` deduplicates nothing today; `list_sessions` (`store.py:215-228`)
+  simply concatenates all sources. Read-back therefore needs a net-new
+  `Store`-level dedup layer keyed on `(source, id)` with **live winning**.
+  It must cover `list_sessions`, `search`, and `_resolve` (ordering-
+  dependent), and **especially `stats` (`store.py:134`), which will
+  double-count sessions/messages/tokens/cost** if a live+archived session
+  is counted twice. Order live sources before the injected `ArchiveSource`
+  so first-match precedence in `_resolve` picks the live copy.
 
 ### Component 4 — CLI `archive` command (`cli.py`)
 
@@ -181,51 +196,155 @@ resolution; written by a future `scrollback config` command (not v1).
   per adapter, using synthetic fixtures / the demo-data builders.
 - **Incremental sync**: synthetic store — first sync archives all; second
   sync with one changed `message_count` re-archives only that one; a session
-  removed from the live store stays in the vault (`kept_orphan`).
+  removed from the live store stays in the vault (`kept_orphan`); a live
+  session that reads back with **fewer** messages than the archived copy is
+  skipped and counted `kept_shrunk` (never-shrink guard, §7.3).
 - **Read-back**: `ArchiveSource` over a temp vault returns sessions equal to
   the originals; a session deleted from its source is still readable.
 - **Read-only invariant**: source mtimes unchanged after a sync (parallels
   `test_sources_live.py:46`).
-- **Dedup**: a live+archived `(source, id)` appears once, with the chosen
-  precedence.
+- **Dedup**: a live+archived `(source, id)` appears once in `list_sessions`
+  and in `search`, with **live winning** (§7.2); and — critically —
+  `stats` counts it **once** (regression test against the double-count
+  hazard: sessions/messages/tokens/cost must not inflate when the same
+  `(source, id)` is present live and archived).
 - All using `tmp_path`; no real user data.
 
 ---
 
 ## 6. Phasing (each phase independently releasable)
 
-- **Phase 1 — Lossless core:** `Session.from_dict` + `archivefmt` +
-  round-trip tests. Foundation; no user-facing change.
-- **Phase 2 — Archive engine + CLI:** `ArchiveStore.sync`,
-  `scrollback archive`, doctor/uninstall wiring, tests. Ships the durable
-  local vault.
-- **Phase 3 — Read-back:** `ArchiveSource` + Store injection + dedup +
-  tests. Archived sessions become browsable / searchable / exportable,
-  including deleted ones.
-- **Phase 4 — Web + polish:** UI sync/badges; `--verify`; opt-in
-  auto-sync-on-web-launch (like `_background_index_refresh`, `cli.py:713`).
+Status as of 2026-07-08. Phases 1–4 are **shipped**; Phase 5 is future work.
+
+- **Phase 1 — Lossless core — SHIPPED.** `Session/Message/Part.from_dict`
+  (`models.py`) + `archivefmt.py` (`to_archive_json` / `from_archive_json`,
+  strict JSON-native encoder) + round-trip tests (`test_models.py`). Also
+  fixed `_to_dt` to pass through existing `datetime` objects (caught by the
+  linchpin `from_dict(asdict(s)) == s` test). No user-facing change.
+- **Phase 2 — Archive engine + CLI — SHIPPED.** `archive.py`
+  (`ArchiveStore.sync` with inverted prune + never-shrink guard; path
+  sanitization; `stats`), `scrollback archive` (`--source`, `--dest`,
+  `--stats`), doctor wiring, uninstall keep-by-default + `--purge-archive`,
+  tests (`test_archive.py`). Ships the durable local vault.
+- **Phase 3 — Read-back — SHIPPED.** `sources/archive.py` (`ArchiveSource`,
+  preserving original `(source, id)`), `Store.with_archive` injection, the
+  cross-cutting `_dedup` layer (live wins; `archived` / `archived_only`
+  badges), `_resolve` + `_search_lexical` archive fallbacks, and
+  `_make_store` wiring (`--source archive`). Archived sessions — including
+  deleted ones — are browsable / searchable / exportable.
+- **Phase 4 — Web + polish — SHIPPED (read-only scope).** Archive injected
+  into the web store (`_default_store`), `archived` / `archived_only` in
+  `serialize.py`, list-row + header badges and a tri-state archive filter
+  chip in the web UI, and `scrollback archive --verify`. **Deviation from
+  the original plan:** the "sync now" web button was intentionally dropped —
+  it would require a mutating endpoint, breaking the read-only web
+  invariant. Sync stays a CLI verb. Opt-in auto-sync-on-web-launch (like
+  `_background_index_refresh`, `cli.py:713`) was also deferred.
 - **Phase 5 (future, out of v1):** multi-machine / cloud sync.
+
+### Known follow-ups (post-Phase-4)
+
+- **Indexed search does not cover archived-only sessions.** The FTS index
+  syncs live sources only, so a deleted-but-archived session is found via the
+  lexical path but not the fast indexed path. A future enhancement could
+  index the vault.
+- **Web UI redesign (view vs. archive split).** The current UI bolts archive
+  badges + a filter chip onto the existing single list. A dedicated
+  browse-live vs. browse-archive information architecture is planned; see
+  [`ROADMAP.md`](../ROADMAP.md).
+- **Opt-in auto-sync-on-web-launch** (deferred from Phase 4).
 
 ---
 
-## 7. Open questions to resolve at the start of the implementation session
+## 7. Resolved design decisions
 
-1. **Auto-sync vs. manual (v1).** Manual only (`scrollback archive`), or
-   also opportunistic auto-sync when running `web`/`list` (like the FTS
-   background refresh)? Leaning: **manual in v1**, opt-in auto later.
-2. **Dedup precedence** when a session is both live and archived. Leaning:
-   **live wins** (fresher) + an **"archived" badge** on sessions that exist
-   only in the vault (deleted from the agent).
-3. **Versioning on change.** When an archived session later grows, do we
-   **overwrite** the archived copy (latest canonical) or keep **historical
-   versions**? Leaning: **overwrite** — a session only ever appends/grows;
-   versioning adds much complexity for little value.
-4. **opencode fidelity.** Its `Session.raw` is empty (`{}`) and it is a
-   shared SQLite DB, so there is no per-session file to byte-copy. Lossless
-   archiving relies on the `messages`/`parts` (and their `raw`) we load.
-   Confirm this normalized-only fidelity is acceptable for opencode.
-5. **Uninstall default.** Keep the vault on `scrollback uninstall` unless a
-   `--purge-archive` flag is given. Confirm.
+The five questions deferred to the implementation session were resolved in
+the planning re-audit (see the code-grounded rationale under each). All
+five kept their original leaning; two picked up a small addition, flagged
+**[+]** below.
+
+### 7.1 Auto-sync vs. manual — **manual only in v1**
+
+`scrollback archive` is an explicit verb; no opportunistic auto-sync in
+v1. Rationale: the FTS background refresh (`cli.py:713`) exists because a
+*stale search returns wrong answers* — a correctness concern. A stale
+archive only means "not yet captured", never a wrong answer served, so
+silent auto-sync would be an unrequested write side-effect that muddies the
+clean "read vs. archive" boundary. Phase 4 may add **opt-in**
+auto-sync-on-web-launch mirroring `_background_index_refresh`.
+
+### 7.2 Dedup precedence — **live wins** [+]
+
+When a `(source, id)` exists both live and archived, the live copy wins (it
+is definitionally at least as fresh; sync only ever copies live → vault). A
+**badge** marks sessions that exist only in the vault (deleted from the
+agent).
+
+**[+] Cost correction from the re-audit.** This is *not* a small precedence
+tweak. `Store` performs **no deduplication anywhere today** — `list_sessions`
+(`store.py:215-228`) flattens every source's sessions and sorts, trusting
+that `(source, id)` is globally unique across the source list. Injecting an
+`ArchiveSource` therefore requires a **net-new, cross-cutting dedup layer**
+at the `Store` level, affecting four independent iteration paths:
+
+- `list_sessions` (`store.py:215-228`) — would emit literal duplicates.
+- `stats` (`store.py:134`) — iterates `list_sessions`, so **would
+  silently double-count** sessions, messages, tokens, and cost. This is the
+  sharpest hazard; naive read-back corrupts every aggregate stat.
+- `search` — iterates sources; would return duplicate hits (verify shape
+  during Phase 3).
+- `_resolve` (`store.py:247-250`) — first-match-wins, so single-session
+  precedence is determined by **source ordering**; live sources must be
+  ordered before the injected `ArchiveSource`.
+
+This is the plan's heaviest hidden lift and belongs in Phase 3. The **badge**
+is surfaced via `Session.raw["archived_only"] = True` (fed from the manifest's
+`last_seen_live`) rather than a new `models.py` field, keeping the model
+behavior-free and adapter-agnostic.
+
+### 7.3 Versioning on change — **overwrite, but never shrink** [+]
+
+An archived session is overwritten with the latest canonical copy; no
+historical versions are kept. The premise "a session only ever
+appends/grows" holds for append-only agents, so overwrite normally loses
+nothing, and versioning adds large complexity (multi-file per session, GC
+policy, read-back ambiguity) for a rare payoff.
+
+**[+] Never-shrink guard.** If a re-sync produces a session with **fewer**
+messages than the archived copy (corruption, partial read, agent
+truncation), that is a signal, not a normal overwrite. `ArchiveStore.sync`
+must **skip** such a write and count it (e.g. `kept_shrunk`) rather than
+clobbering good archived data with a degraded read. This preserves the
+durability guarantee against bad reads; it is self-contained in `sync` with
+no ripple into other components.
+
+### 7.4 opencode fidelity — **normalized-only, accepted**
+
+opencode's `Session.raw` is empty (`{}`) and it is a shared SQLite DB, so
+there is no per-session file to byte-copy. "Lossless" here means lossless
+*relative to scrollback's normalized model* (the `messages`/`parts` and
+their `raw`), not byte-identical to the source — scrollback never held the
+raw opencode blob. The round-trip invariant
+`from_dict(to_archive_json(s)) == s` still holds on the normalized object.
+
+**Phase-1 verification item (not a decision):** confirm opencode's
+message/part `raw` fields *are* populated even though session `raw` is
+empty, so we are not silently dropping fidelity that is in fact available.
+
+### 7.5 Uninstall default — **keep the vault; `--purge-archive` opt-in**
+
+`scrollback uninstall` keeps the vault by default; a new `--purge-archive`
+flag is required to remove it. This is the point of the three-tier split:
+the cache/index is disposable (`uninstall` deletes it today at
+`cli.py:958`), but the vault is durable user data and deleting it on
+uninstall would be a data-loss footgun.
+
+**Net-new code, not a modification.** No `--purge-archive` flag exists
+anywhere yet, and `cmd_uninstall`'s `targets` list (`cli.py:957-960`) only
+ever appends the FTS index today. The vault entry is entirely new: add it to
+`targets` **only** when `args.purge_archive` is set, and list it distinctly
+in the confirmation prompt (`cli.py:967-970`) as "durable archive — will be
+permanently deleted".
 
 ---
 
