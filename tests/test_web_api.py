@@ -65,11 +65,14 @@ class FakeSource(Source):
 
 
 @pytest.fixture
-def client():
+def client(tmp_path):
     # allowed_hosts=[] disables the Host guard for the TestClient (whose
     # default Host header is "testserver"); the guard has its own tests.
+    # Pin archive_path to an isolated (nonexistent) temp dir so the test never
+    # reads the machine's real ~/.scrollback/archive vault.
     store = Store([FakeSource()])
-    return TestClient(create_app(store, allowed_hosts=[]))
+    return TestClient(create_app(store, allowed_hosts=[],
+                                 archive_path=tmp_path / "no-vault"))
 
 
 def test_health(client):
@@ -262,3 +265,64 @@ def test_host_guard_allows_configured_host():
     c = TestClient(app)
     assert c.get("/api/health", headers={"host": "myhost.local:9000"}).status_code == 200
     assert c.get("/api/health", headers={"host": "other.com"}).status_code == 403
+
+
+# -- Phase 4: archive fields surface through the API ------------------------
+
+
+def _archive_client(tmp_path, *, delete_s2=False):
+    """A client over a live FakeSource plus a real archive vault.
+
+    The live `src` is the injected base; the vault is composed by the app via
+    `archive_path` + the `mode` param. s1 is live+archived; s2 is archived and
+    (optionally) deleted from live so it becomes archive-only. Tests that want
+    archived data query with `?mode=all` (or `mode=archive`).
+    """
+    from scrollback import archive
+
+    src = FakeSource()
+    archive.ArchiveStore(tmp_path / "vault").sync(Store([src]))
+    if delete_s2:
+        del src._sessions["s2"]
+    return TestClient(create_app(
+        Store([src]), allowed_hosts=[], archive_path=tmp_path / "vault"
+    ))
+
+
+def test_sessions_expose_archive_flags(tmp_path):
+    c = _archive_client(tmp_path)
+    rows = {s["id"]: s for s in c.get("/api/sessions").json()["sessions"]}
+    # Both sessions have every archive key present (contract), and the plain
+    # list keys don't crash the frontend.
+    for s in rows.values():
+        assert "archived" in s and "archived_only" in s
+    # s1 lives + is archived -> archived True, archived_only False (live wins).
+    assert rows["s1"]["archived"] is True
+    assert rows["s1"]["archived_only"] is False
+
+
+def test_deleted_session_is_archive_only(tmp_path):
+    c = _archive_client(tmp_path, delete_s2=True)
+    rows = {s["id"]: s for s in c.get("/api/sessions").json()["sessions"]}
+    assert "s2" in rows  # still browsable via the vault
+    assert rows["s2"]["archived_only"] is True
+    assert rows["s2"]["archived"] is True
+    # ...and its detail is loadable.
+    detail = c.get("/api/sessions/fake/s2").json()
+    assert detail["id"] == "s2"
+    assert detail["archived_only"] is True
+
+
+def test_search_hits_expose_archive_flags(tmp_path):
+    c = _archive_client(tmp_path, delete_s2=True)
+    hits = c.get("/api/search?q=conversation").json()
+    assert hits, "expected a lexical hit in the archived-only session"
+    assert all("archived_only" in h for h in hits)
+
+
+def test_no_vault_leaves_flags_false(tmp_path):
+    """Without an archive, sessions serialize with archive flags = False."""
+    c = TestClient(create_app(Store([FakeSource()]), allowed_hosts=[],
+                              archive_path=tmp_path / "no-vault"))
+    rows = c.get("/api/sessions").json()["sessions"]
+    assert all(s["archived"] is False and s["archived_only"] is False for s in rows)

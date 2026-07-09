@@ -36,6 +36,50 @@
               title="Usage statistics per tool">stats</button>
     </div>
 
+    <div class="bar-right">
+      <!-- Archive everything into the vault; visible in every view. -->
+      <button id="sync-all" class="sync-all-btn"
+              title="Copy every live session into your durable archive vault">
+        &#8681; Archive all
+      </button>
+      <button id="about-btn" class="icon-btn" title="About scrollback" aria-label="About scrollback" aria-haspopup="dialog">&#9432;</button>
+      <button id="theme-toggle" class="icon-btn" title="Toggle light / dark" aria-label="Toggle light or dark theme">&#9681;</button>
+    </div>
+  </header>
+
+  <div class="filters">
+    <!-- Browse-only scope: which corpus + which agents. Hidden in Stats. -->
+    <div class="filters-browse" id="filters-browse">
+      <span class="filters-eyebrow">Showing</span>
+      <div class="modeswitch" id="modeswitch" role="radiogroup" aria-label="Which sessions to show">
+        <button class="mode-btn" data-mode="live" role="radio" aria-checked="true"
+                title="Sessions from your agents right now">live</button>
+        <button class="mode-btn" data-mode="archive" role="radio" aria-checked="false"
+                title="Your durable archive vault, including sessions the agent deleted">archive</button>
+        <button class="mode-btn" data-mode="all" role="radio" aria-checked="false"
+                title="Live and archived together (live copy wins for duplicates)">all</button>
+      </div>
+      <span class="filters-conn" aria-hidden="true">from</span>
+      <div class="srcfilter" id="srcfilter" role="group" aria-label="Filter by agent"></div>
+    </div>
+    <!-- Date range: applies to BOTH browse and stats, so it always shows.
+         `data-active` reflects whether a filter is set (drives the "all time"
+         hint + the clear button), since an empty native date input misleadingly
+         shows today's date as a placeholder. -->
+    <div class="date-filters" id="date-filters" data-active="false">
+      <span class="date-label">Date range</span>
+      <span class="date-alltime">all time</span>
+      <label for="since">since</label>
+      <input id="since" type="date" aria-label="From date" />
+      <label for="until">until</label>
+      <input id="until" type="date" aria-label="To date" />
+      <button id="date-clear" class="date-clear" title="Clear the date range (show all time)"
+              aria-label="Clear date range">&times;</button>
+    </div>
+  </div>
+
+  <!-- Search bar: its own row. Scope follows the active Live/Archive/All mode. -->
+  <div class="searchbar" id="searchbar">
     <div class="search">
       <input id="search-input" type="search" autocomplete="off" spellcheck="false"
              placeholder="search&hellip;" />
@@ -45,22 +89,6 @@
         <button id="scope-contents" class="scope-btn" aria-pressed="false"
                 title="Search inside message text across sessions">contents</button>
       </div>
-    </div>
-
-    <div class="bar-right">
-      <button id="about-btn" class="icon-btn" title="About scrollback" aria-label="About scrollback" aria-haspopup="dialog">&#9432;</button>
-      <button id="theme-toggle" class="icon-btn" title="Toggle light / dark" aria-label="Toggle light or dark theme">&#9681;</button>
-    </div>
-  </header>
-
-  <div class="filters">
-    <span class="filters-label">showing</span>
-    <div class="srcfilter" id="srcfilter"></div>
-    <div class="date-filters">
-      <label for="since">since</label>
-      <input id="since" type="date" />
-      <label for="until">until</label>
-      <input id="until" type="date" />
     </div>
   </div>
 

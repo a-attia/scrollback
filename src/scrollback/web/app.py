@@ -1,20 +1,28 @@
-"""FastAPI application exposing a read-only JSON API over the Store.
+"""FastAPI application exposing a JSON API over the Store.
 
 Design notes
 ------------
-* Strictly read-only: there are no mutating endpoints. The Store and its
-  adapters never write to the agents' data.
+* **Never writes to your agents' data.** Reading is strictly read-only. The
+  only writes are to scrollback's own durable vault (`~/.scrollback/archive`),
+  and only via the explicit archive-sync endpoints below.
 * Intended to bind to 127.0.0.1 only (enforced by the `web` CLI command).
 * The frontend is static (HTML/CSS/JS) served from `web/static/`; the
   browser talks to the JSON endpoints below.
+* Browsing has a top-level mode -- live / archive / all -- passed as a `mode`
+  query param to the read endpoints (see `create_app`).
 
 Endpoints
 ---------
-GET /api/sources                     -> available source adapters
-GET /api/sessions?source&dir&q&limit -> session summaries (newest first)
-GET /api/sessions/{source}/{id}      -> full session with messages/parts
-GET /api/search?q&dir&limit          -> search hits across sessions
-GET /api/export/{source}/{id}?format&reasoning&tools -> rendered document
+GET  /api/sources                          -> available source adapters
+GET  /api/sessions?source&mode&dir&q&limit -> session summaries (newest first)
+GET  /api/sessions/{source}/{id}           -> full session with messages/parts
+GET  /api/search?q&mode&dir&limit          -> search hits across sessions
+GET  /api/export/{source}/{id}?format&...  -> rendered document
+GET  /api/stats?mode                       -> aggregate usage for the mode
+GET  /api/archive                          -> durable-vault overview
+POST /api/archive/sync                     -> sync all live sessions -> vault
+POST /api/archive/sync/{source}/{id}       -> archive/update one session
+GET  /api/archive/jobs/{job_id}/events     -> SSE progress for a sync job
 """
 
 from __future__ import annotations
@@ -39,6 +47,101 @@ from datetime import datetime, timezone
 from .. import __version__, export
 from ..serialize import message_dict, search_hit, session_detail, session_summary
 from ..store import Store
+
+
+class _SyncJob:
+    """State for one in-flight archive sync, observable via SSE.
+
+    Progress is pushed by `ArchiveStore.sync`'s `progress(done, total)`
+    callback. The job runs to completion server-side regardless of whether any
+    SSE client stays connected.
+    """
+
+    def __init__(self, job_id: str, kind: str) -> None:
+        import threading
+
+        self.id = job_id
+        self.kind = kind  # "all" | "one"
+        self.done = 0
+        self.total = 0
+        self.phase = "starting"
+        self.result: dict | None = None
+        self.error: str | None = None
+        self.finished = threading.Event()
+
+    def on_progress(self, done: int, total: int) -> None:
+        self.done, self.total, self.phase = done, total, "syncing"
+
+    def snapshot(self) -> dict:
+        return {
+            "id": self.id, "kind": self.kind, "done": self.done,
+            "total": self.total, "phase": self.phase,
+            "result": self.result, "error": self.error,
+            "finished": self.finished.is_set(),
+        }
+
+
+class _JobRegistry:
+    """In-process registry of sync jobs with single-flight for full syncs."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self._jobs: dict[str, _SyncJob] = {}
+        self._lock = threading.Lock()
+        self._active_all: str | None = None  # single-flight guard for sync-all
+
+    def get(self, job_id: str) -> "_SyncJob | None":
+        return self._jobs.get(job_id)
+
+    def start(self, kind: str, work) -> _SyncJob:
+        """Register a job and run `work(job)` in a daemon thread.
+
+        For `kind="all"`, if a full sync is already running, its existing job is
+        returned instead of starting a second one (single-flight; the manifest
+        is a single SQLite writer).
+        """
+        import threading
+        import uuid
+
+        with self._lock:
+            if kind == "all" and self._active_all:
+                existing = self._jobs.get(self._active_all)
+                if existing and not existing.finished.is_set():
+                    return existing
+            job = _SyncJob(uuid.uuid4().hex, kind)
+            self._jobs[job.id] = job
+            if kind == "all":
+                self._active_all = job.id
+
+        def run() -> None:
+            try:
+                work(job)
+            except Exception as exc:  # keep the failure visible to the client
+                job.error = str(exc)
+            finally:
+                job.phase = "done"
+                job.finished.set()
+                if kind == "all":
+                    with self._lock:
+                        if self._active_all == job.id:
+                            self._active_all = None
+
+        threading.Thread(target=run, daemon=True).start()
+        return job
+
+
+def _default_store() -> Store:
+    """The production store: live sources plus the durable archive vault.
+
+    Archived sessions -- including ones the agent has deleted -- become
+    browsable/searchable in the web UI, deduped live-wins (see
+    `Store.with_archive`). No-op when no vault exists. Tests inject their own
+    store and bypass this.
+    """
+    from .. import archive
+
+    return Store().with_archive(archive.default_archive_path())
 
 
 def _parse_dt(s: str | None) -> datetime | None:
@@ -76,8 +179,18 @@ def create_app(
     on_idle=None,
     idle_timeout: float = 0.0,
     allowed_hosts: list[str] | None = None,
+    archive_path=None,
 ):
     """Build the FastAPI app. A custom Store can be injected for tests.
+
+    The injected (or default) `store` is treated as the **live base**. The
+    top-level Live / Archive / All mode (a `mode` query param on the read
+    endpoints) composes stores from this live base plus the durable vault at
+    `archive_path` (default: `archive.default_archive_path()`):
+
+      * live    -> the live base only (fastest);
+      * archive -> the vault only (incl. deleted sessions);
+      * all     -> live base + vault, deduped (live wins).
 
     If `idle_timeout` > 0 and `on_idle` is provided, the app runs a watchdog:
     the frontend pings `/api/heartbeat` periodically, and if no ping arrives
@@ -90,8 +203,47 @@ def create_app(
     non-loopback address. `None` => loopback-only; an empty list disables the
     check (not recommended).
     """
+    from .. import archive as _archive_mod
+
     app = FastAPI(title="scrollback", version=__version__)
-    _store = store if store is not None else Store()
+    _live_store = store if store is not None else Store()
+    _vault_path = (
+        archive_path if archive_path is not None
+        else _archive_mod.default_archive_path()
+    )
+    def _store_for(mode: str) -> Store:
+        """Return the Store for a browsing mode (live | archive | all).
+
+        Not cached across requests: the vault can be created (or grow) at
+        runtime via the sync endpoints, and `with_archive` is a cheap
+        existence-check + wrap, so we compose fresh each call to always reflect
+        the current vault state.
+        """
+        mode = mode if mode in ("live", "archive", "all") else "all"
+        if mode == "live":
+            # Compose with the archive so live sessions still get an accurate
+            # archive-status tag (archived / stale) -- consistent with the other
+            # modes -- but hide sessions that exist ONLY in the vault (deleted).
+            return _live_store.with_archive(_vault_path, hide_archived_only=True)
+        if mode == "archive":
+            # Live sources dropped; only the vault reader remains. Pass the live
+            # session keys as a probe so a still-live archived session is
+            # labelled "archived", not "deleted" (archived_only).
+            return Store([], live_probe=_live_store.live_keys()).with_archive(_vault_path)
+        return _live_store.with_archive(_vault_path)  # all
+
+    # Back-compat alias: endpoints that don't take a mode use the "all" store
+    # (the previous default behaviour).
+    _store = _store_for("all")
+
+    # Activity hook: a running sync should count as activity so the idle
+    # auto-shutdown watchdog does not kill the server mid-sync. The watchdog
+    # (when installed) replaces this with a real timestamp bump.
+    _activity = {"bump": lambda: None}
+
+    def _note_activity() -> None:
+        _activity["bump"]()
+
     _install_host_guard(app, allowed_hosts)
 
     # Translate unexpected source/IO failures (locked/corrupt DB, unreadable
@@ -110,7 +262,7 @@ def create_app(
 
     watchdog_on = idle_timeout > 0 and on_idle is not None
     if watchdog_on:
-        _install_heartbeat_watchdog(app, on_idle, idle_timeout)
+        _install_heartbeat_watchdog(app, on_idle, idle_timeout, _activity)
     else:
         # Always expose the config endpoint so the frontend can ask once and
         # skip heartbeats when auto-shutdown is not in effect.
@@ -126,10 +278,16 @@ def create_app(
         # The store holds the available ones; we additionally surface any
         # registered-but-unavailable adapters so the UI can show them greyed.
         from ..sources import registry
+        from ..sources.archive import ArchiveSource
 
         out: list[dict[str, Any]] = []
         available_names = set()
+        # Report only real agent adapters. The archive reader is a browse MODE
+        # (live/archive/all), not an agent source, so it must not appear as a
+        # source-filter chip.
         for s in _store.sources:
+            if isinstance(s, ArchiveSource):
+                continue
             available_names.add(s.name)
             out.append({
                 "name": s.name,
@@ -151,6 +309,7 @@ def create_app(
     @app.get("/api/sessions")
     def api_sessions(
         source: str | None = None,
+        mode: str = "all",
         dir: str | None = None,
         q: str | None = None,
         since: str | None = None,
@@ -159,12 +318,19 @@ def create_app(
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=60, ge=1, le=2000),
     ) -> dict[str, Any]:
-        if source and source not in {s.name for s in _store.sources}:
+        base = _store_for(mode)
+        # `source` filters WITHIN the mode, on the session's ORIGINAL source
+        # (so archived opencode copies are kept for source="opencode"). Mode is
+        # the archive axis; there is no source="archive". Accept any known live
+        # adapter name -- including ones only present in the injected live store
+        # (tests) or the global registry.
+        from ..sources import registry
+        known = {s.name for s in _live_store.sources} | {s.name for s in registry.all_sources()}
+        if source and source not in known:
             raise HTTPException(status_code=400, detail=f"unknown source: {source}")
-        st = _store.with_sources([source]) if source else _store
         # Fetch one extra to tell the client whether more pages exist.
-        rows = st.list_sessions(
-            directory=dir, query=q,
+        rows = base.list_sessions(
+            source=source, directory=dir, query=q,
             since=_parse_dt(since), until=_parse_dt(until),
             offset=offset, limit=limit + 1, fold_subagents=fold,
         )
@@ -181,14 +347,14 @@ def create_app(
     def api_session_detail(source: str, session_id: str) -> dict[str, Any]:
         """Full session including all messages. For very large sessions the
         frontend should prefer the meta + windowed messages endpoints."""
-        sess = _store.load_session(session_id, source=source)
+        sess = _store_for("all").load_session(session_id, source=source)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
         return session_detail(sess)
 
     @app.get("/api/sessions/{source}/{session_id}/meta")
     def api_session_meta(source: str, session_id: str) -> dict[str, Any]:
-        sess = _store.load_session_meta(session_id, source=source)
+        sess = _store_for("all").load_session_meta(session_id, source=source)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
         return session_summary(sess)
@@ -200,7 +366,7 @@ def create_app(
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=40, ge=1, le=500),
     ) -> dict[str, Any]:
-        msgs = _store.load_messages(
+        msgs = _store_for("all").load_messages(
             session_id, source=source, offset=offset, limit=limit + 1
         )
         has_more = len(msgs) > limit
@@ -215,6 +381,7 @@ def create_app(
     @app.get("/api/search")
     def api_search(
         q: str,
+        mode: str = "all",
         dir: str | None = None,
         since: str | None = None,
         until: str | None = None,
@@ -222,7 +389,7 @@ def create_app(
     ) -> list[dict[str, Any]]:
         if not q.strip():
             return []
-        hits = _store.search(
+        hits = _store_for(mode).search(
             q, directory=dir, since=_parse_dt(since), until=_parse_dt(until), limit=limit
         )
         return [search_hit(h) for h in hits]
@@ -241,7 +408,7 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"bad format: {format}")
         if math not in export.MATH_MODES:
             raise HTTPException(status_code=400, detail=f"bad math mode: {math}")
-        sess = _store.load_session(session_id, source=source)
+        sess = _store_for("all").load_session(session_id, source=source)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
         kwargs: dict[str, Any] = {}
@@ -267,7 +434,7 @@ def create_app(
         user's real browser (where window.print() works)."""
         if math not in export.MATH_MODES:
             raise HTTPException(status_code=400, detail=f"bad math mode: {math}")
-        sess = _store.load_session(session_id, source=source)
+        sess = _store_for("all").load_session(session_id, source=source)
         if sess is None:
             raise HTTPException(status_code=404, detail="session not found")
         html = export.to_html(sess, include_reasoning=reasoning, include_tools=tools, math=math)
@@ -280,14 +447,17 @@ def create_app(
         return Response(content=html, media_type="text/html; charset=utf-8")
 
     @app.get("/api/stats")
-    def api_stats(since: str | None = None, until: str | None = None) -> dict[str, Any]:
+    def api_stats(
+        mode: str = "all", since: str | None = None, until: str | None = None
+    ) -> dict[str, Any]:
         """Aggregate usage statistics: per-source breakdown plus overall totals.
 
-        Honours the same `since`/`until` window as the session list, so the
-        stats page reflects the active date filters. Metadata-only (does not
-        load message bodies), so it is cheap to compute on demand.
+        Honours the browsing `mode` (live / archive / all) so the stats page
+        reflects the selected scope, and the same `since`/`until` window as the
+        session list. Metadata-only (does not load message bodies), so it is
+        cheap to compute on demand.
         """
-        st = _store.stats(since=_parse_dt(since), until=_parse_dt(until))
+        st = _store_for(mode).stats(since=_parse_dt(since), until=_parse_dt(until))
 
         def _src_row(u) -> dict[str, Any]:
             return {
@@ -325,6 +495,96 @@ def create_app(
             "newest": st.newest.isoformat() if st.newest else None,
         }
 
+    @app.get("/api/archive")
+    def api_archive() -> dict[str, Any]:
+        """Overview of the durable vault: path + per-source + orphan counts.
+
+        Returns ``{"exists": false}`` when no vault has been created, so the
+        frontend can show a "start archiving" prompt.
+        """
+        vault = _archive_mod.ArchiveStore(_vault_path)
+        if not vault.exists():
+            return {"exists": False, "path": str(_vault_path)}
+        s = vault.stats()
+        return {
+            "exists": True,
+            "path": str(vault.path),
+            "sessions": s["sessions"],
+            "orphans": s["orphans"],
+            "per_source": s.get("per_source", {}),
+        }
+
+    _jobs = _JobRegistry()
+
+    @app.post("/api/archive/sync")
+    def api_archive_sync() -> dict[str, Any]:
+        """Start a full incremental sync of live sessions into the vault.
+
+        Returns a `job_id`; watch progress on the SSE events endpoint. Writes
+        ONLY to the vault -- never to agent data. Single-flight: a concurrent
+        request returns the running job.
+        """
+        vault = _archive_mod.ArchiveStore(_vault_path)
+
+        def work(job: _SyncJob) -> None:
+            _note_activity()
+            job.result = vault.sync(_live_store, progress=job.on_progress)
+
+        job = _jobs.start("all", work)
+        return {"job_id": job.id, **job.snapshot()}
+
+    @app.post("/api/archive/sync/{source}/{session_id}")
+    def api_archive_sync_one(source: str, session_id: str) -> dict[str, Any]:
+        """Archive/update a single live session. Writes ONLY to the vault."""
+        vault = _archive_mod.ArchiveStore(_vault_path)
+
+        def work(job: _SyncJob) -> None:
+            _note_activity()
+            job.total = 1
+            outcome = vault.sync_one(_live_store, source, session_id)
+            job.done = 1
+            job.result = {"outcome": outcome}
+
+        job = _jobs.start("one", work)
+        return {"job_id": job.id, **job.snapshot()}
+
+    @app.get("/api/archive/jobs/{job_id}")
+    def api_archive_job(job_id: str) -> dict[str, Any]:
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown job")
+        return job.snapshot()
+
+    @app.get("/api/archive/jobs/{job_id}/events")
+    def api_archive_job_events(job_id: str):
+        """Server-Sent Events stream of a sync job's progress.
+
+        Emits `{done,total,phase}` frames until the job finishes, then a final
+        frame carrying the result summary. The sync itself continues
+        server-side even if the client disconnects.
+        """
+        from starlette.responses import StreamingResponse
+
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown job")
+
+        def stream():
+            import json as _json
+            import time
+
+            last = None
+            while not job.finished.is_set():
+                snap = job.snapshot()
+                if snap != last:
+                    yield f"data: {_json.dumps(snap)}\n\n"
+                    last = snap
+                time.sleep(0.15)
+            _note_activity()
+            yield f"data: {_json.dumps(job.snapshot())}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
     @app.get("/api/health")
     def api_health() -> dict[str, Any]:
         return {"status": "ok", "version": __version__,
@@ -333,6 +593,36 @@ def create_app(
     # -- static frontend ---------------------------------------------------
 
     if _STATIC_DIR.is_dir():
+        # Serve the three app-owned files (index.html + style.css + app.js)
+        # ourselves with `Cache-Control: no-cache`, so the native app's WebView
+        # (WKWebView) MUST revalidate them every load instead of serving a stale
+        # copy from its heuristic cache. index.html also gets the app version
+        # stamped onto the CSS/JS URLs as a second cache-busting layer. Vendor
+        # assets (which never change) stay on the normally-cached static mount.
+        from fastapi.responses import HTMLResponse, Response
+
+        _no_cache = {"Cache-Control": "no-cache, must-revalidate"}
+        _index_html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        _index_html = (
+            _index_html
+            .replace('href="/style.css"', f'href="/style.css?v={__version__}"')
+            .replace('src="/app.js"', f'src="/app.js?v={__version__}"')
+        )
+
+        @app.get("/", include_in_schema=False)
+        def index() -> "HTMLResponse":
+            return HTMLResponse(_index_html, headers=_no_cache)
+
+        @app.get("/style.css", include_in_schema=False)
+        def style_css() -> "Response":
+            return Response((_STATIC_DIR / "style.css").read_text(encoding="utf-8"),
+                            media_type="text/css", headers=_no_cache)
+
+        @app.get("/app.js", include_in_schema=False)
+        def app_js() -> "Response":
+            return Response((_STATIC_DIR / "app.js").read_text(encoding="utf-8"),
+                            media_type="text/javascript", headers=_no_cache)
+
         app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")
 
     return app
@@ -371,18 +661,24 @@ def _install_host_guard(app: "FastAPI", allowed_hosts: list[str] | None) -> None
     app.add_middleware(_HostGuard)
 
 
-def _install_heartbeat_watchdog(app: "FastAPI", on_idle, idle_timeout: float) -> None:
+def _install_heartbeat_watchdog(
+    app: "FastAPI", on_idle, idle_timeout: float, activity: dict | None = None
+) -> None:
     """Auto-stop when the page stops sending heartbeats (window closed).
 
     The frontend POSTs /api/heartbeat on an interval. A background thread
     checks the last-seen time; if it exceeds `idle_timeout`, it calls
     `on_idle()` once. A grace period before the first heartbeat avoids
-    shutting down during initial page load.
+    shutting down during initial page load. `activity["bump"]` is wired so a
+    running archive sync also counts as activity (won't be killed mid-sync).
     """
     import threading
     import time
 
     state = {"last": time.monotonic() + max(idle_timeout, 10.0), "fired": False}
+
+    if activity is not None:
+        activity["bump"] = lambda: state.__setitem__("last", time.monotonic())
 
     @app.post("/api/heartbeat")
     def heartbeat() -> dict[str, str]:

@@ -246,6 +246,9 @@ const MSG_PAGE = 40;        // transcript message window size
 const state = {
   sources: [],
   enabled: new Set(),
+  // Top-level browse mode: "live" (default) | "archive" | "all". Drives the
+  // session list, search, and the stats viewer via the API `mode` param.
+  mode: "live",
   // search scope: which targets the query is matched against.
   scope: { titles: true, contents: false },
   query: "",
@@ -296,7 +299,7 @@ function setMath(mode) {
   state.math = mode;
   localStorage.setItem("scrollback-math", mode);
   // Repaint any export buttons whose label reflects the math mode.
-  document.querySelectorAll(".btn.math-aware").forEach(
+  document.querySelectorAll(".btn.math-follow").forEach(
     (b) => b.dispatchEvent(new CustomEvent("scrollback:math")));
   rerenderMessages();
 }
@@ -354,6 +357,43 @@ function toggleSource(btn, name) {
 function enabledParam() {
   // If exactly one source is enabled, pass it to the API for efficiency.
   return state.enabled.size === 1 ? [...state.enabled][0] : null;
+}
+
+// -- browse mode (live / archive / all) ------------------------------------
+
+function initMode() {
+  const saved = localStorage.getItem("scrollback-mode");
+  state.mode = ["live", "archive", "all"].includes(saved) ? saved : "live";
+  document.querySelectorAll("#modeswitch .mode-btn").forEach((btn) => {
+    btn.setAttribute("aria-checked", btn.dataset.mode === state.mode ? "true" : "false");
+    btn.onclick = () => setMode(btn.dataset.mode);
+  });
+}
+
+function setMode(mode) {
+  if (mode === state.mode) return;
+  state.mode = mode;
+  localStorage.setItem("scrollback-mode", mode);
+  document.querySelectorAll("#modeswitch .mode-btn").forEach((btn) => {
+    btn.setAttribute("aria-checked", btn.dataset.mode === mode ? "true" : "false");
+  });
+  // Archive mode with nothing open -> show the archive landing overview.
+  // (The stats view shows live + archive groups regardless of mode, so it
+  // does not need reloading on a mode change.)
+  if (isStatsOpen()) {
+    // stay on stats; nothing mode-dependent to refresh
+  } else if (mode === "archive" && !state.current) {
+    showArchiveLanding();
+  } else if (!state.current) {
+    // Leaving the archive landing back to a normal empty reader.
+    const empty = $("#empty");
+    empty.hidden = false;
+    empty.replaceChildren(
+      el("img", { class: "empty-icon", src: "/favicon.svg", width: "112", height: "112", alt: "scrollback" }),
+      el("p", {}, "Pick a session on the left, or search to dig through everything."),
+      el("p", { class: "empty-sub" }, "Reading is local; scrollback never writes to your agents."));
+  }
+  resetAndLoad();
 }
 
 // ====================================================================
@@ -428,6 +468,7 @@ async function loadListPage(reset = false) {
 async function loadSessions(reset) {
   state.list.kind = "sessions";
   const p = new URLSearchParams({ offset: String(state.list.offset), limit: String(PAGE), fold: "true" });
+  p.set("mode", state.mode);
   if (state.query) p.set("q", state.query);
   if (state.since) p.set("since", state.since);
   if (state.until) p.set("until", state.until);
@@ -472,6 +513,7 @@ async function loadSearch(reset) {
   // Search is not offset-paginated server-side; fetch a generous cap once.
   if (!reset) return;
   const p = new URLSearchParams({ q: state.query, limit: "200" });
+  p.set("mode", state.mode);
   if (state.since) p.set("since", state.since);
   if (state.until) p.set("until", state.until);
   const hits = (await getJSON("/api/search?" + p.toString()))
@@ -489,12 +531,14 @@ async function loadCombined(reset) {
   if (!reset) return;
   // Fetch title matches and content matches in parallel.
   const sp = new URLSearchParams({ offset: "0", limit: "200", fold: "true", q: state.query });
+  sp.set("mode", state.mode);
   if (state.since) sp.set("since", state.since);
   if (state.until) sp.set("until", state.until);
   const src = enabledParam();
   if (src) sp.set("source", src);
 
   const cp = new URLSearchParams({ q: state.query, limit: "200" });
+  cp.set("mode", state.mode);
   if (state.since) cp.set("since", state.since);
   if (state.until) cp.set("until", state.until);
 
@@ -579,8 +623,33 @@ function metaLine(s) {
     s.message_count != null ? el("span", {}, `${s.message_count} msgs`) : null,
     s.tokens_input != null ? el("span", { class: "s-badge", title: "tokens in/out" },
       `${fmtTokens(s.tokens_input)}/${fmtTokens(s.tokens_output)}`) : null,
+    provenanceTag(s),
     s.directory ? el("span", { class: "s-dir", title: s.directory }, baseName(s.directory)) : null
   );
+}
+
+// A provenance tag identifying where a session comes from. Always shown so
+// that in "all" mode live and archived rows are visually distinguishable.
+//   deleted  -> in the vault only (removed from its agent)
+//   stale    -> live, archived copy is out of date
+//   archived -> live + up-to-date archived copy
+//   live     -> not archived
+function provenanceTag(s) {
+  if (s.archived_only) {
+    return el("span", { class: "s-tag tag-deleted",
+      title: "In your archive only \u2014 deleted from its agent" }, "deleted");
+  }
+  if (s.archive_status === "stale") {
+    return el("span", { class: "s-tag tag-stale",
+      title: "Live + archived, but the archived copy is out of date (has newer messages)" },
+      "live + stale");
+  }
+  if (s.archived || s.archive_status === "archived") {
+    return el("span", { class: "s-tag tag-archived",
+      title: "This session is live AND kept in your durable archive" }, "live + archived");
+  }
+  return el("span", { class: "s-tag tag-live",
+    title: "Live \u2014 not in your archive" }, "live");
 }
 
 function searchRow(h) {
@@ -664,6 +733,172 @@ async function openSession(source, id, focusMessageId) {
 function enc(s) { return encodeURIComponent(s); }
 
 // ====================================================================
+// help affordances (UI-wide)
+// ====================================================================
+
+// A small "?" marker with an explanatory tooltip. Used across the UI to
+// explain terms (archive states, token buckets, modes, ...).
+function helpIcon(text) {
+  return el("span", { class: "help-icon", tabindex: "0", role: "img",
+    "aria-label": text, title: text }, "\u24d8");
+}
+
+// ====================================================================
+// archive sync (web-driven; writes to the vault only, never to agents)
+// ====================================================================
+
+// Archive/update a single session, then refresh its header to show new status.
+async function syncOneSession(meta) {
+  await runSyncJob(
+    `/api/archive/sync/${enc(meta.source)}/${enc(meta.id)}`,
+    `Archiving ${meta.short_id || meta.id}\u2026`,
+  );
+  // Re-fetch meta so the status + button reflect the new archived state.
+  // Update ONLY the archive zone -- re-rendering the whole header would clear
+  // the loaded message body (transcript rebuild).
+  try {
+    const fresh = await getJSON(`/api/sessions/${enc(meta.source)}/${enc(meta.id)}/meta`);
+    transcriptMeta = fresh;
+    refreshArchiveZone(fresh);
+  } catch (_e) { /* status refresh is best-effort */ }
+  // Also refresh the session list so the row's provenance tag updates.
+  if (state.list.kind === "sessions") resetAndLoad();
+}
+
+// Full incremental sync of everything live -> vault.
+async function syncAll() {
+  const summary = await runSyncJob("/api/archive/sync", "Syncing all sessions\u2026");
+  if (isStatsOpen()) loadStats();               // refresh archive-group counts
+  else if (state.mode === "archive") showArchiveLanding();
+  resetAndLoad();   // refresh list so new archive statuses show
+  return summary;
+}
+
+// POST to a sync endpoint, then consume its SSE progress stream, driving the
+// shared progress-bar overlay. Resolves with the job's result summary.
+async function runSyncJob(postUrl, title) {
+  const bar = showProgress(title);
+  let job;
+  try {
+    job = await (await fetch(postUrl, { method: "POST" })).json();
+  } catch (err) {
+    bar.fail("could not start sync: " + err.message);
+    throw err;
+  }
+  return await new Promise((resolve) => {
+    const es = new EventSource(`/api/archive/jobs/${enc(job.job_id)}/events`);
+    es.onmessage = (ev) => {
+      let snap;
+      try { snap = JSON.parse(ev.data); } catch (_e) { return; }
+      bar.update(snap.done, snap.total, snap.phase);
+      if (snap.finished) {
+        es.close();
+        if (snap.error) bar.fail(snap.error);
+        else bar.done(snap.result);
+        resolve(snap.result);
+      }
+    };
+    es.onerror = () => {
+      // Stream dropped; fall back to a single status poll before giving up.
+      es.close();
+      getJSON(`/api/archive/jobs/${enc(job.job_id)}`).then((snap) => {
+        if (snap.error) bar.fail(snap.error); else bar.done(snap.result);
+        resolve(snap.result);
+      }).catch(() => { bar.fail("progress stream lost"); resolve(null); });
+    };
+  });
+}
+
+// A lightweight progress overlay. Returns handles to update / finish it.
+function showProgress(title) {
+  let host = $("#progress");
+  if (!host) {
+    host = el("div", { id: "progress", class: "progress-host", hidden: true });
+    document.body.append(host);
+  }
+  const fill = el("div", { class: "progress-fill" });
+  const label = el("div", { class: "progress-label" }, title);
+  const pct = el("div", { class: "progress-pct" }, "");
+  const card = el("div", { class: "progress-card" },
+    el("div", { class: "progress-title" }, title),
+    el("div", { class: "progress-track" }, fill),
+    el("div", { class: "progress-meta" }, label, pct));
+  host.replaceChildren(card);
+  host.hidden = false;
+
+  const setPct = (frac, indeterminate) => {
+    fill.classList.toggle("indeterminate", !!indeterminate);
+    if (!indeterminate) fill.style.width = Math.round(frac * 100) + "%";
+  };
+  setPct(0, true);
+
+  const hideSoon = (ms) => setTimeout(() => { host.hidden = true; }, ms);
+  return {
+    update(done, total, phase) {
+      if (total > 0) { setPct(done / total, false); pct.textContent = `${done}/${total}`; }
+      else setPct(0, true);
+      label.textContent = phase === "syncing" ? "syncing\u2026" : (phase || "");
+    },
+    done(result) {
+      setPct(1, false);
+      const parts = result && typeof result === "object"
+        ? Object.entries(result).filter(([, v]) => typeof v === "number" && v)
+            .map(([k, v]) => `${v} ${k.replace("_", " ")}`)
+        : [];
+      label.textContent = "done" + (parts.length ? ": " + parts.join(", ") : "");
+      pct.textContent = "";
+      hideSoon(3500);
+    },
+    fail(msg) { label.textContent = "failed: " + msg; fill.classList.add("failed"); hideSoon(6000); },
+  };
+}
+
+// The archive landing view (shown in Archive mode with nothing open).
+async function showArchiveLanding() {
+  state.current = null;
+  markActiveRow();
+  markView("browse");
+  $("#transcript").hidden = true;
+  $("#stats").hidden = true;
+  const empty = $("#empty");
+  empty.hidden = false;
+  empty.replaceChildren(el("div", { class: "loading" }, "loading archive\u2026"));
+
+  let data;
+  try {
+    data = await getJSON("/api/archive");
+  } catch (err) {
+    empty.replaceChildren(el("p", {}, "could not load archive: " + err.message));
+    return;
+  }
+  if (!data.exists) {
+    empty.replaceChildren(
+      el("img", { class: "empty-icon", src: "/favicon.svg", width: "96", height: "96", alt: "" }),
+      el("p", {}, "No durable archive yet."),
+      el("p", { class: "empty-sub" },
+        "Run ", el("code", {}, "scrollback archive"), " (or click below) to keep your sessions forever."),
+      el("button", { class: "btn arc-btn",
+        title: "Archive every live session into your durable vault",
+        onclick: () => syncAll() }, "Sync all now"));
+    return;
+  }
+  const perSource = Object.entries(data.per_source || {})
+    .map(([k, v]) => el("li", {}, `${k}: ${v}`));
+  empty.replaceChildren(
+    el("div", { class: "archive-landing" },
+      el("h1", {}, "Your archive"),
+      el("p", { class: "empty-sub" }, data.path),
+      el("div", { class: "archive-stat-row" },
+        el("div", { class: "archive-stat" }, el("b", {}, String(data.sessions)), " sessions kept"),
+        el("div", { class: "archive-stat" }, el("b", {}, String(data.orphans)),
+          " no longer live", helpIcon("Kept in your archive but deleted from their agent."))),
+      perSource.length ? el("ul", { class: "archive-sources" }, ...perSource) : null,
+      el("button", { class: "btn arc-btn",
+        title: "Archive every live session into your durable vault",
+        onclick: () => syncAll() }, "Sync all now")));
+}
+
+// ====================================================================
 // stats view (usage per tool + overall)
 // ====================================================================
 
@@ -678,6 +913,9 @@ function markView(view) {
   const b = $("#view-browse"), s = $("#view-stats");
   if (b) b.setAttribute("aria-checked", String(view === "browse"));
   if (s) s.setAttribute("aria-checked", String(view === "stats"));
+  // In Stats view the session rail and the browse-only scope controls
+  // (mode + source) are irrelevant; the date range still applies to both.
+  document.body.classList.toggle("viewing-stats", view === "stats");
 }
 
 // Switch to the browse view (session list + reader). Does not clear filters.
@@ -722,6 +960,11 @@ function toggleRail() {
   else openRail();
 }
 
+function isStatsOpen() {
+  const panel = $("#stats");
+  return panel && !panel.hidden;
+}
+
 async function openStats() {
   markView("stats");
   state.current = null;
@@ -731,40 +974,82 @@ async function openStats() {
   $("#empty").hidden = true;
   const panel = $("#stats");
   panel.hidden = false;
-  panel.replaceChildren(el("div", { class: "loading" }, "computing statistics\u2026"));
   $("#reader").scrollTop = 0;
+  await loadStats();
+}
 
-  // Stats honours the same since/until as the browse filters.
-  const p = new URLSearchParams();
-  if (state.since) p.set("since", state.since);
-  if (state.until) p.set("until", state.until);
-  const qs = p.toString();
+// Fetch + render stats. The stats view always shows TWO groups -- live and
+// archive -- so the two corpora are clearly distinguished (independent of the
+// browse mode). Re-callable when date filters change.
+async function loadStats() {
+  const panel = $("#stats");
+  if (!panel || panel.hidden) return;
+  panel.replaceChildren(el("div", { class: "loading" }, "computing statistics\u2026"));
 
-  let data;
+  const qp = (mode) => {
+    const p = new URLSearchParams();
+    p.set("mode", mode);
+    if (state.since) p.set("since", state.since);
+    if (state.until) p.set("until", state.until);
+    return "/api/stats?" + p.toString();
+  };
+
+  let live, arch;
   try {
-    data = await getJSON("/api/stats" + (qs ? "?" + qs : ""));
+    [live, arch] = await Promise.all([getJSON(qp("live")), getJSON(qp("archive"))]);
   } catch (err) {
     panel.replaceChildren(el("div", { class: "loading" }, "error: " + err.message));
     return;
   }
-  panel.replaceChildren(renderStats(data));
+  panel.replaceChildren(renderStats(live, arch));
 }
 
 function statCell(n) { return el("td", { class: "num" }, fmtTokens(n)); }
 
-function renderStats(d) {
+function renderStats(live, arch) {
   const wrap = el("div", { class: "stats-wrap" });
 
-  // Scope line: reflect the active since/until filters (or "all time").
-  const scope = (state.since || state.until)
+  const dateScope = (state.since || state.until)
     ? `filtered ${state.since || "\u2026"} \u2192 ${state.until || "now"}`
     : "all time";
 
   wrap.append(el("div", { class: "stats-head" },
     el("h1", {}, "Usage statistics"),
-    el("p", { class: "stats-sub" },
-      `${scope} \u00b7 ${d.sessions} sessions \u00b7 ${fmtTokens(d.messages)} messages` +
-      (d.oldest ? ` \u00b7 ${fmtDate(d.oldest)} \u2192 ${fmtDate(d.newest)}` : ""))));
+    el("p", { class: "stats-sub" }, dateScope,
+      helpIcon("Two groups: your live agent sessions, and your durable "
+        + "archive (which may include sessions the agent has since deleted). "
+        + "Date filters apply to both."))));
+
+  // Two labelled groups: live sessions, then the archive.
+  wrap.append(renderStatsSection("live sessions", "live", live,
+    "Sessions currently present in your agents."));
+  wrap.append(renderStatsSection("archive", "archived", arch,
+    "Sessions kept in your durable vault (may include deleted ones)."));
+
+  // Explanatory note (the four-bucket / cache-dominates caveat).
+  wrap.append(el("p", { class: "stats-note" },
+    "Tokens are counted in four buckets. In agentic sessions the conversation " +
+    "context is re-sent each turn but served from the prompt cache, so cache " +
+    "reads usually dominate volume while costing a fraction of fresh input. " +
+    "Cost is shown only where the tool records it (\u2014 = not reported)."));
+  return wrap;
+}
+
+// Render one stats group (live or archive) with a labelled, tinted heading.
+function renderStatsSection(title, tone, d, help) {
+  const section = el("section", { class: `stats-section stats-${tone}` });
+  section.append(el("div", { class: "stats-section-head" },
+    el("span", { class: `s-tag tag-${tone}` }, title),
+    el("span", { class: "stats-section-sub" },
+      `${d.sessions} sessions \u00b7 ${fmtTokens(d.messages)} messages` +
+      (d.oldest ? ` \u00b7 ${fmtDate(d.oldest)} \u2192 ${fmtDate(d.newest)}` : "")),
+    helpIcon(help)));
+
+  if (!d.sessions) {
+    section.append(el("p", { class: "stats-empty" },
+      tone === "archived" ? "Nothing archived yet." : "No live sessions."));
+    return section;
+  }
 
   // Per-tool table.
   const head = el("tr", {},
@@ -801,15 +1086,8 @@ function renderStats(d) {
     statCell(t.tokens_reasoning),
     el("td", { class: "num" }, fmtCost(t.cost))));
 
-  wrap.append(el("table", { class: "stats-table" }, el("thead", {}, head), body, foot));
-
-  // Explanatory note (the four-bucket / cache-dominates caveat).
-  wrap.append(el("p", { class: "stats-note" },
-    "Tokens are counted in four buckets. In agentic sessions the conversation " +
-    "context is re-sent each turn but served from the prompt cache, so cache " +
-    "reads usually dominate volume while costing a fraction of fresh input. " +
-    "Cost is shown only where the tool records it (\u2014 = not reported)."));
-  return wrap;
+  section.append(el("table", { class: "stats-table" }, el("thead", {}, head), body, foot));
+  return section;
 }
 
 function renderHeader(meta) {
@@ -842,6 +1120,7 @@ function renderHeader(meta) {
       copyId,
       meta.model ? el("span", {}, "model: " + meta.model) : null,
       meta.git_branch ? el("span", {}, "branch: " + meta.git_branch) : null,
+      provenanceTag(meta),
       meta.tokens_input != null ? el("span", { title: "input / output tokens" }, `tokens ${fmtTokens(meta.tokens_input)}/${fmtTokens(meta.tokens_output)}`) : null,
       meta.tokens_cache_read != null && (meta.tokens_cache_read || meta.tokens_cache_write)
         ? el("span", { title: "prompt cache read / write" }, `cache ${fmtTokens(meta.tokens_cache_read)}/${fmtTokens(meta.tokens_cache_write)}`) : null,
@@ -910,8 +1189,8 @@ function findBar() {
   return el("div", { class: "t-find" },
     input,
     el("span", { class: "find-count", id: "find-count" }, ""),
-    el("button", { class: "btn", onclick: () => stepFind(-1) }, "\u2191"),
-    el("button", { class: "btn", onclick: () => stepFind(1) }, "\u2193"));
+    el("button", { class: "btn", title: "Previous match", onclick: () => stepFind(-1) }, "\u2191"),
+    el("button", { class: "btn", title: "Next match", onclick: () => stepFind(1) }, "\u2193"));
 }
 
 // A checkbox-style toggle: a leading box (checked/unchecked) + a label, so
@@ -935,10 +1214,8 @@ function checkToggle(label, key) {
   return btn;
 }
 
-// Which exports the math mode actually changes. Markdown / copy / JSON are
-// always verbatim LaTeX source, so the mode is inert for them.
-const MATH_AWARE_FMT = new Set(["html"]);
-// Short suffix naming the active math mode, for buttons it affects.
+// Short suffix naming the active math mode, appended to math-following export
+// buttons (print / html). Markdown / copy / JSON are always verbatim source.
 const MATH_SUFFIX = { raw: "", latex: " \u00b7 LaTeX", rendered: " \u00b7 typeset" };
 
 function actionBar(meta) {
@@ -962,42 +1239,88 @@ function actionBar(meta) {
   const view = el("div", { class: "bar-zone" },
     el("span", { class: "zone-label" }, "view"), show, math);
 
-  // -- EXPORT zone: actions that produce a file / clipboard -------------
-  // A button whose label reflects the math mode when math applies to it.
-  const exp = (fmt, base) => {
-    const aware = MATH_AWARE_FMT.has(fmt);
-    const btn = el("button", {
-      class: "btn" + (aware ? " math-aware" : ""),
-      onclick: () => downloadExport(meta, fmt),
-    });
-    const paint = () => {
-      btn.textContent = "\u2193 " + base + (aware ? MATH_SUFFIX[state.math] : "");
-    };
+  // -- EXPORT zone: two sub-groups make the math relationship explicit --
+  //   * verbatim group (copy / md / json): always keep LaTeX as source.
+  //   * math group (print / html): output follows the "math" setting above.
+  // A plain download button (math-independent).
+  const exp = (fmt, base) => el("button", {
+    class: "btn",
+    title: `Download this session as ${base.toUpperCase()} (LaTeX kept as source)`,
+    onclick: () => downloadExport(meta, fmt),
+  }, "\u2193 " + base);
+
+  // A math-following export button: label carries the active math mode, and
+  // it repaints when the mode changes.
+  const mathExp = (make, baseLabel, onclick, titleBase) => {
+    const btn = el("button", { class: "btn math-follow", onclick,
+      title: `${titleBase} \u2014 follows the math setting above` });
+    const paint = () => { btn.textContent = make() + MATH_SUFFIX[state.math]; };
     paint();
-    if (aware) btn.addEventListener("scrollback:math", paint);
+    btn.addEventListener("scrollback:math", paint);
     return btn;
   };
 
-  const printBtn = el("button", { class: "btn math-aware", onclick: () => printSession(meta) });
-  const paintPrint = () => { printBtn.textContent = "\u2399 print" + MATH_SUFFIX[state.math]; };
-  paintPrint();
-  printBtn.addEventListener("scrollback:math", paintPrint);
-
-  const exportRow = el("div", { class: "action-grp" },
+  const verbatimGrp = el("div", { class: "ctrl-grp export-grp" },
+    el("span", { class: "ctrl-label" }, "verbatim"),
     el("button", { class: "btn", title: "Copy as Markdown (LaTeX kept as source)",
       onclick: () => copySession(meta, "markdown") },
       "copy ", el("span", { class: "k" }, "md")),
-    printBtn,
-    exp("html", "html"), exp("markdown", "md"), exp("json", "json"));
+    exp("markdown", "md"), exp("json", "json"),
+    helpIcon("Copy, Markdown, and JSON always keep LaTeX as verbatim source \u2014 "
+      + "the math setting does not change them."));
+
+  const mathGrp = el("div", { class: "ctrl-grp export-grp export-math" },
+    el("span", { class: "ctrl-label" }, "math \u2192"),
+    mathExp(() => "\u2399 print", "print", () => printSession(meta),
+      "Open a print-friendly view"),
+    mathExp(() => "\u2193 html", "html", () => downloadExport(meta, "html"),
+      "Download this session as HTML"),
+    helpIcon("Print and HTML render math per the \u201cmath\u201d setting above "
+      + "(source / paste-ready / typeset)."));
 
   const exportZone = el("div", { class: "bar-zone" },
-    el("span", { class: "zone-label" }, "export"), exportRow,
-    el("span", { class: "zone-note", title:
-      "Math display affects on-screen view, print, and HTML export. "
-      + "Markdown, copy, and JSON always keep LaTeX as verbatim source." },
-      "\u24d8 md / copy / json keep LaTeX source"));
+    el("span", { class: "zone-label" }, "export"), verbatimGrp, mathGrp);
 
-  return el("div", { class: "t-actions" }, view, exportZone);
+  return el("div", { class: "t-actions" }, view, archiveZone(meta), exportZone);
+}
+
+// ARCHIVE zone: per-session status + an archive/update button that writes the
+// session to the durable vault (never to agent data), with a progress bar.
+function archiveZone(meta) {
+  const status = meta.archived_only ? "deleted" : (meta.archive_status || "none");
+  const label = {
+    none: "not archived", archived: "archived",
+    stale: "archived (stale)", deleted: "archived (deleted from agent)",
+  }[status];
+  const statusEl = el("span", { class: `arc-status arc-${status}` }, label,
+    helpIcon({
+      none: "This live session is not yet in your durable archive.",
+      archived: "A copy is kept in your durable archive and is up to date.",
+      stale: "Archived, but the live session has newer messages \u2014 update to refresh.",
+      deleted: "This session exists only in your archive; its agent deleted it.",
+    }[status]));
+
+  // Archive-only (deleted) sessions have no live source to re-sync from.
+  const canSync = status === "none" || status === "stale";
+  const btnLabel = status === "stale" ? "update archive" : "archive this";
+  const btn = el("button", {
+    class: "btn arc-btn", disabled: canSync ? undefined : "disabled",
+    title: canSync ? "Copy this session into your durable archive"
+                   : "Nothing to do \u2014 this session is up to date in your archive",
+    onclick: () => syncOneSession(meta),
+  }, btnLabel);
+
+  return el("div", { class: "bar-zone", id: "archive-zone" },
+    el("span", { class: "zone-label" }, "archive"),
+    el("div", { class: "ctrl-grp arc-grp" }, statusEl, canSync ? btn : null));
+}
+
+// Replace ONLY the archive zone in place, so refreshing a session's archive
+// status after a sync does not rebuild the transcript (which would wipe the
+// already-loaded message body). No-op if the header isn't showing this meta.
+function refreshArchiveZone(meta) {
+  const old = document.getElementById("archive-zone");
+  if (old) old.replaceWith(archiveZone(meta));
 }
 
 let loadedMessages = [];   // accumulates message objects as we page
@@ -1353,6 +1676,7 @@ scopeTitlesBtn.addEventListener("click", () => toggleScope("titles"));
 scopeContentsBtn.addEventListener("click", () => toggleScope("contents"));
 $("#view-browse").addEventListener("click", showBrowse);
 $("#view-stats").addEventListener("click", openStats);
+$("#sync-all").addEventListener("click", () => syncAll());
 $("#rail-toggle").addEventListener("click", toggleRail);
 $("#rail-backdrop").addEventListener("click", closeRail);
 $("#about-btn").addEventListener("click", openAbout);
@@ -1379,14 +1703,29 @@ matchMedia("(min-width: 881px)").addEventListener("change", (e) => {
 $("#brand").addEventListener("click", clearAll);
 $("#brand").style.cursor = "pointer";
 $("#theme-toggle").addEventListener("click", toggleTheme);
+// Reflect whether a date filter is active, so the UI shows "all time" (and
+// hides the clear button) when neither bound is set -- an empty native date
+// input misleadingly renders today's date as a placeholder.
+function syncDateActive() {
+  const active = !!(state.since || state.until);
+  const el = $("#date-filters");
+  if (el) el.setAttribute("data-active", active ? "true" : "false");
+}
+
 // Date filters drive both views: refresh the stats page in place when it is
 // open, otherwise reload the browse list.
 function onDateChange() {
+  syncDateActive();
   if (!$("#stats").hidden) openStats();
   else resetAndLoad();
 }
 $("#since").addEventListener("change", (e) => { state.since = e.target.value; onDateChange(); });
 $("#until").addEventListener("change", (e) => { state.until = e.target.value; onDateChange(); });
+$("#date-clear").addEventListener("click", () => {
+  state.since = ""; state.until = "";
+  $("#since").value = ""; $("#until").value = "";
+  onDateChange();
+});
 
 function openFromHash() {
   const h = decodeURIComponent(location.hash.replace(/^#/, ""));
@@ -1425,12 +1764,14 @@ async function startHeartbeat() {
 (async function boot() {
   initTheme();
   initMath();
+  initMode();
   try {
     await loadSources();
     prefillSearchFromUrl();
     updateScopeButtons();
     await loadListPage(true);
     if (location.hash) openFromHash();
+    else if (state.mode === "archive") showArchiveLanding();
     startHeartbeat();
   } catch (err) {
     sessionsEl.replaceChildren(el("li", { class: "loading" }, "failed to load: " + err.message));

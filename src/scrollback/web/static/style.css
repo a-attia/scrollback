@@ -70,6 +70,37 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* App shell: a flex column of header -> filters -> layout. The layout flexes
+   to fill whatever remains, so the header + filter bar stay flush at the top
+   and full-bleed regardless of the filter bar's height (which differs between
+   Browse and Stats). Avoids a brittle height calc that assumed a fixed bar. */
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  /* Below this sensible floor the UI stops compressing and a horizontal
+     scrollbar appears instead of squashing controls indefinitely. */
+  min-width: 360px;
+}
+/* When the window is narrower than the floor, scroll horizontally rather than
+   crushing the layout. `html` owns the horizontal scroll so the flex body can
+   still fill height. */
+html { overflow-x: auto; }
+.bar, .filters, .searchbar { flex: none; min-width: 360px; }
+.layout { flex: 1 1 auto; min-height: 0; min-width: 360px; }
+
+/* Search bar: its own full-bleed row beneath the filter bar. */
+.searchbar {
+  display: flex; align-items: center;
+  padding: .5rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--ink);
+}
+.searchbar .search { max-width: none; }   /* span the row */
+/* Search doesn't apply to the stats view, so hide its row there. */
+body.viewing-stats .searchbar { display: none; }
+
 kbd {
   font-family: var(--mono);
   font-size: 11px;
@@ -201,64 +232,158 @@ button { font-family: inherit; }
 
 /* ---------- filter row (clear active/inactive) ---------- */
 
+/* The filter bar reads as a sentence: "Showing [mode] from [sources]".
+   Two control families with two shapes: a segmented control (pick one) and
+   multi-select chips (pick any). */
 .filters {
   display: flex;
   align-items: center;
-  gap: .6rem;
+  gap: .55rem;
   padding: .5rem 1rem;
   border-bottom: 1px solid var(--line);
   background: var(--ink);
   flex-wrap: wrap;
 }
-.filters-label {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--fg-faint);
-  text-transform: uppercase;
-  letter-spacing: .08em;
+/* connective labels: an eyebrow before the mode switch, a quiet "from" before
+   the sources. Both are prose, not controls -- kept low-contrast. */
+.filters-eyebrow, .filters-conn {
+  font-family: var(--ui); font-size: 12px; color: var(--fg-faint);
 }
-.srcfilter { display: flex; gap: .45rem; }
+.filters-eyebrow { font-weight: 600; }
+.filters-conn { font-style: italic; margin: 0 .1rem; }
+
+/* MODE = segmented control: one connected unit, one filled active segment. */
+.modeswitch {
+  display: inline-flex; align-items: stretch;
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  background: var(--panel);
+}
+.mode-btn {
+  font-family: var(--mono); font-size: 12px; line-height: 1;
+  padding: .38rem .85rem; cursor: pointer;
+  background: transparent; color: var(--fg-dim); border: none;
+  border-right: 1px solid var(--line);
+  transition: background .12s, color .12s;
+}
+.mode-btn:last-child { border-right: none; }
+.mode-btn:hover { color: var(--fg); background: var(--panel-2); }
+.mode-btn[aria-checked="true"] {
+  background: var(--focus); color: var(--ink); font-weight: 600;
+}
+.mode-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+/* SOURCE = multi-select chips: lighter + flatter than the segmented control,
+   so they read as subordinate toggles rather than a second switch. */
+.srcfilter { display: flex; gap: .4rem; flex-wrap: wrap; }
 .src-toggle {
-  font-family: var(--mono);
-  font-size: 12px;
-  border-radius: 999px;
-  padding: .3rem .8rem;
+  font-family: var(--mono); font-size: 12px; line-height: 1;
+  border-radius: 6px;
+  padding: .34rem .6rem;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: .45rem;
+  display: inline-flex; align-items: center; gap: .4rem;
   user-select: none;
-  border: 1.5px solid var(--src, var(--line));
-  background: transparent;
+  border: 1px solid transparent;
+  background: var(--panel);
   color: var(--fg-dim);
-  transition: background .12s, color .12s, opacity .12s;
+  transition: background .12s, color .12s, border-color .12s, opacity .12s;
 }
 .src-toggle .dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--src);
-  box-shadow: 0 0 0 0 transparent;
+  width: 8px; height: 8px; border-radius: 2px;   /* square dot: reads as a checkbox, not a radio */
+  background: var(--fg-faint);
 }
-.src-toggle .check { font-weight: 700; }
+.src-toggle .check { font-weight: 700; color: var(--src); display: none; }
 .src-toggle[aria-pressed="true"] {
-  background: var(--src-soft);
-  color: var(--fg);
+  background: var(--src-soft); color: var(--fg);
+  border-color: var(--src);
 }
-.src-toggle[aria-pressed="false"] {
-  opacity: .5;
-  border-style: dashed;
-}
-.src-toggle[aria-pressed="false"] .dot { background: var(--fg-faint); }
+.src-toggle[aria-pressed="true"] .dot { background: var(--src); }
+.src-toggle[aria-pressed="true"] .check { display: inline; }
+.src-toggle:hover { color: var(--fg); }
+.src-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 
-/* a known source with no data on this machine: shown but disabled */
+/* a known source with no data on this machine: plainly inert */
 .src-toggle.src-unavailable {
-  opacity: .4;
-  border-style: dotted;
-  cursor: not-allowed;
-  color: var(--fg-faint);
-  background: transparent;
+  opacity: .45; cursor: not-allowed;
+  color: var(--fg-faint); background: transparent;
+  border: 1px dashed var(--line);
 }
 .src-toggle.src-unavailable .dot { background: var(--fg-faint); }
 .src-toggle.src-unavailable:hover { color: var(--fg-faint); }
+
+/* provenance tags on session rows (live / archived / stale / deleted) */
+.s-tag {
+  font-size: 10px; padding: 0 .35rem; border-radius: 4px;
+  border: 1px solid var(--line); text-transform: uppercase; letter-spacing: .03em;
+}
+.tag-live { color: var(--codex); border-color: var(--codex); background: var(--codex-soft); }
+.tag-archived { color: var(--focus); border-color: var(--focus); background: var(--focus-soft); }
+.tag-stale { color: var(--opencode); border-color: var(--opencode); background: var(--opencode-soft); }
+.tag-deleted { color: var(--claudecode); border-color: var(--claudecode); background: var(--claudecode-soft); }
+
+/* per-session archive status + button (transcript header) */
+.arc-grp { gap: .5rem; }
+.arc-status {
+  font-family: var(--mono); font-size: 11.5px; color: var(--fg-dim);
+  display: inline-flex; align-items: center; gap: .3rem; padding-left: .15rem;
+}
+.arc-none { color: var(--fg-faint); }
+.arc-stale { color: var(--opencode); font-weight: 600; }
+.arc-deleted { color: var(--claudecode); font-weight: 600; }
+.arc-archived { color: var(--codex); font-weight: 600; }
+.arc-btn { border-color: var(--focus); color: var(--focus); }
+.arc-btn:hover { background: var(--focus-soft); }
+
+/* the export button clusters share the boxed look of the VIEW groups */
+.export-grp { gap: .35rem; }
+/* the math-following exports (print / html) get a subtle accent tying them
+   to the "math" control, since their output follows that setting */
+.export-math { border-color: var(--focus); }
+.export-math .ctrl-label { color: var(--focus); }
+
+/* UI-wide help icon */
+.help-icon {
+  font-size: 11px; color: var(--fg-faint); cursor: help;
+  vertical-align: baseline;
+}
+.help-icon:hover, .help-icon:focus { color: var(--focus); outline: none; }
+
+/* archive landing view */
+.archive-landing { text-align: center; max-width: 34rem; }
+.archive-stat-row { display: flex; gap: 1.5rem; justify-content: center; margin: 1rem 0; }
+.archive-stat { font-size: 14px; color: var(--fg-dim); }
+.archive-stat b { color: var(--fg); font-size: 20px; }
+.archive-sources { list-style: none; padding: 0; color: var(--fg-dim); font-family: var(--mono); font-size: 12px; }
+
+/* sync progress overlay */
+.progress-host {
+  position: fixed; bottom: 1.2rem; right: 1.2rem; z-index: 50;
+}
+.progress-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: .8rem 1rem; min-width: 20rem; box-shadow: 0 6px 24px rgba(0,0,0,.25);
+}
+.progress-title { font-size: 13px; font-weight: 600; margin-bottom: .5rem; }
+.progress-track { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.progress-fill { height: 100%; width: 0%; background: var(--focus); transition: width .2s; }
+.progress-fill.indeterminate { width: 40%; animation: prog-indet 1.1s ease-in-out infinite; }
+.progress-fill.failed { background: var(--claudecode); }
+@keyframes prog-indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.progress-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--fg-dim); margin-top: .4rem; }
+
+/* browse-only scope controls (mode + source); the whole group hides in Stats */
+.filters-browse { display: flex; align-items: center; gap: .55rem; flex-wrap: wrap; }
+
+/* Archive-all: a persistent action, visible in every mode. Accented to tie it
+   to the archive concept without shouting. */
+.sync-all-btn {
+  font-family: var(--mono); font-size: 12px; line-height: 1;
+  padding: .38rem .8rem; border-radius: 8px; cursor: pointer;
+  color: var(--focus); background: var(--focus-soft);
+  border: 1px solid var(--focus);
+  transition: background .12s, color .12s;
+}
+.sync-all-btn:hover { background: var(--focus); color: var(--ink); }
+.sync-all-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 
 .date-filters { display: flex; align-items: center; gap: .35rem; margin-left: auto; }
 .date-filters input {
@@ -272,13 +397,53 @@ button { font-family: inherit; }
   color-scheme: dark light;
 }
 .date-filters label { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); }
+/* a heading for the date range, shown only in Stats (where it stands alone) */
+.date-label {
+  display: none;
+  font-family: var(--ui); font-size: 12px; font-weight: 600; color: var(--fg-faint);
+  margin-right: .15rem;
+}
+/* "all time" hint: visible only when no date filter is set. The native date
+   inputs (which misleadingly show today's date when empty) + their labels +
+   the clear button are hidden in that state so nothing looks like an active
+   filter. In Stats the label always shows so the row reads "Date range ...". */
+.date-alltime {
+  font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  font-style: italic; margin-left: .3rem;
+}
+.date-clear {
+  background: none; border: none; cursor: pointer;
+  color: var(--fg-faint); font-size: 15px; line-height: 1; padding: 0 .2rem;
+}
+.date-clear:hover { color: var(--claudecode); }
+/* inactive (no range set): show "all time", hide the pickers + clear */
+.date-filters[data-active="false"] label,
+.date-filters[data-active="false"] input,
+.date-filters[data-active="false"] .date-clear { display: none; }
+/* active (range set): hide the "all time" hint */
+.date-filters[data-active="true"] .date-alltime { display: none; }
+/* the "Date range" heading (only shown in Stats) always precedes either state */
+.date-label { }
+
+/* ---------- Stats view: hide browse-only chrome, keep the date range ---------- */
+/* The session rail and the "Showing ... from ..." controls don't apply to the
+   stats view; the date range does, so it stays (now left-aligned + labelled). */
+/* NB: the body toggle class is `viewing-stats`, deliberately NOT `stats-view`
+   -- `.stats-view` is the stats *panel* element (padding + overflow), and a
+   `body.stats-view` selector would ALSO match that rule, leaking the panel's
+   padding onto <body> (a 21/28px inset). Keep these names distinct. */
+body.viewing-stats .filters-browse { display: none; }
+body.viewing-stats .date-filters { margin-left: 0; }
+body.viewing-stats .date-label { display: inline; }
+body.viewing-stats .rail { display: none; }
+body.viewing-stats .layout { grid-template-columns: 1fr; }
 
 /* ---------- layout ---------- */
 
 .layout {
   display: grid;
   grid-template-columns: var(--rail-w) 1fr;
-  height: calc(100vh - var(--bar-h) - 2.6rem);
+  /* height comes from the flex shell (.layout { flex:1 }); no brittle calc. */
 }
 
 /* ---------- session rail ---------- */
@@ -471,12 +636,13 @@ button { font-family: inherit; }
 .t-actions { display: flex; flex-direction: column; gap: .5rem; margin-top: .9rem; }
 .bar-zone {
   display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
-  padding-left: 3.4rem; position: relative;
+  padding-left: 5rem; position: relative;
 }
 .zone-label {
-  position: absolute; left: 0; top: .35rem;
+  position: absolute; left: 0; top: .35rem; width: 4.4rem;
   font-family: var(--mono); font-size: 9.5px; font-weight: 600;
   text-transform: uppercase; letter-spacing: .12em; color: var(--fg-faint);
+  white-space: nowrap; overflow: hidden;
 }
 .zone-note {
   font-family: var(--ui); font-size: 10.5px; color: var(--fg-faint);
@@ -491,8 +657,6 @@ button { font-family: inherit; }
 .btn:hover { background: var(--panel-2); border-color: var(--focus); }
 .btn .k { color: var(--fg-faint); }
 .btn[aria-pressed="true"] { border-color: var(--focus); color: var(--focus); }
-/* an export whose output tracks the math mode gets a subtle accent */
-.btn.math-aware { border-style: dashed; }
 
 .action-grp { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
 .ctrl-grp {
@@ -699,6 +863,19 @@ mark.find-hit.current { outline: 2px solid var(--focus); }
   border-top: 2px solid var(--line); border-bottom: none;
   font-weight: 700; color: var(--fg);
 }
+/* two labelled stats groups: live sessions and the archive */
+.stats-section {
+  margin: 0 0 1.6rem; padding: .2rem 0 .2rem 1rem;
+  border-left: 3px solid var(--line);
+}
+.stats-live { border-left-color: var(--codex); }
+.stats-archived { border-left-color: var(--focus); }
+.stats-section-head {
+  display: flex; align-items: center; gap: .55rem; margin: 0 0 .7rem;
+  flex-wrap: wrap;
+}
+.stats-section-sub { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.stats-empty { font-size: 13px; color: var(--fg-faint); font-style: italic; margin: .2rem 0 0; }
 .stats-note {
   margin: 1.4rem 0 0; padding: .8rem 1rem; font-size: 12px; line-height: 1.6;
   color: var(--fg-dim); background: var(--panel); border: 1px solid var(--line);
