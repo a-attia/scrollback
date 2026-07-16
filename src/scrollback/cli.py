@@ -760,9 +760,10 @@ def cmd_web(args: argparse.Namespace) -> int:
         import uvicorn
     except ModuleNotFoundError:
         _eprint(
-            "the web app needs extra dependencies. install with:\n"
-            '    pip install "scrollback[web]"\n'
-            "or:\n"
+            "the web app needs fastapi/uvicorn, which normally ship with scrollback.\n"
+            "if they're missing (e.g. a broken environment), reinstall with:\n"
+            "    pip install --force-reinstall scrollback\n"
+            "or install the packages directly:\n"
             "    pip install fastapi uvicorn"
         )
         return 1
@@ -1248,8 +1249,10 @@ def _run_app_window(app: object, args: argparse.Namespace, url: str) -> int:
         import webview  # pywebview
     except ModuleNotFoundError:
         _eprint(
-            "the desktop app window needs pywebview. install with:\n"
-            '    pip install "scrollback[app]"\n'
+            "the desktop app window needs pywebview, which normally ships with\n"
+            "scrollback. if it's missing (e.g. a broken environment), install it\n"
+            "with:\n"
+            "    pip install pywebview\n"
             "or just run without --app to use your browser."
         )
         return 1

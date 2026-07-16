@@ -14,13 +14,13 @@ modifies, locks for writing, or uploads your data.
 You can use it two ways. From the **command line**, list, search, and export
 your sessions in a single scriptable tool:
 
-![scrollback listing recent sessions in the terminal.](https://raw.githubusercontent.com/a-attia/scrollback/v0.4.0/assets/screenshots/cli.png)
+![scrollback listing recent sessions in the terminal.](https://raw.githubusercontent.com/a-attia/scrollback/v0.5.0/assets/screenshots/cli.png)
 
 Or open the **local web app** to read a transcript in full — with rendered
 Markdown, syntax-highlighted code, and typeset LaTeX math:
 
 ![The scrollback web app showing a session list beside a transcript with
-rendered Markdown, highlighted code, and typeset equations.](https://raw.githubusercontent.com/a-attia/scrollback/v0.4.0/assets/screenshots/web.png)
+rendered Markdown, highlighted code, and typeset equations.](https://raw.githubusercontent.com/a-attia/scrollback/v0.5.0/assets/screenshots/web.png)
 
 Both views read the same on-disk session stores, so you can jump between
 them freely. (The screenshots above use synthetic demo data.)
@@ -28,8 +28,24 @@ them freely. (The screenshots above use synthetic demo data.)
 > **For AI agents:** read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
 > project conventions. This README is for human readers.
 
+## TL;DR
+
+Two commands get you the full experience — CLI, web app, and a
+double-clickable native app:
+
+```bash
+pipx install scrollback
+scrollback install-launcher        # add --app-bundle on macOS for a .app
+```
+
+Then run `scrollback` from your terminal, or double-click the launcher
+(macOS `scrollback.command`, Windows `scrollback.bat`, Linux
+application-menu entry). No extras to pick, no separate `[web]` step —
+everything a user needs is installed by default.
+
 ## Contents
 
+- [TL;DR](#tldr)
 - [Why scrollback](#why-scrollback)
 - [Install](#install)
 - [Quick start](#quick-start)
@@ -62,32 +78,29 @@ on-disk stores (no sync step, no plugins, no upload), and treats
 ## Install
 
 ```bash
-pip install "scrollback[all]"      # CLI + web app + native window + colour
+pipx install scrollback            # recommended: isolated environment
+# or
+pip install scrollback             # if you'd rather share your Python env
 ```
 
-Requires Python 3.10+. The bare CLI has **no runtime dependencies**
-(standard library only); optional features come from extras:
+Requires Python 3.10+. Everything a user needs — the CLI, the local web
+app (FastAPI + uvicorn), the native app window (pywebview), and coloured
+terminal output (rich) — is installed by default. No extras to pick.
 
-- `"scrollback[web]"` — the local web app (FastAPI, uvicorn) and the native
-  app window (pywebview).
-- `"scrollback[rich]"` — coloured terminal output.
-- `"scrollback[all]"` — everything a user might want at runtime (`web` + `rich`).
+[`pipx`](https://pipx.pypa.io) is the recommended path: it keeps
+scrollback in its own environment while still putting `scrollback`,
+`scrollback-web`, and `scrollback-app` on your PATH. Plain `pip` works
+identically otherwise.
 
-If you'd rather keep it isolated from your system Python (recommended, but
-optional), [`pipx`](https://pipx.pypa.io) installs it in its own environment
-and still puts the `scrollback` command on your PATH:
+On Linux the native app window additionally needs a system GTK/Qt WebKit
+backend at runtime. Its absence only disables the native window; the
+browser fallback still works.
 
-```bash
-pipx install "scrollback[all]"
-```
-
-Either way, plain `pip` works the same; `pipx` is just a convenience.
-
-From a local clone (for development), use an editable install with the dev
-extra:
+From a local clone (for development), use an editable install with the
+dev extra:
 
 ```bash
-pip install -e ".[web,dev]"
+pip install -e ".[dev]"
 ```
 
 ## Quick start
@@ -292,7 +305,7 @@ window; see [Running it as an app](#running-it-as-an-app)).
 
 ![The scrollback web app in Archive mode: a session list with live / archived /
 deleted provenance tags beside the archive dashboard (sessions kept, integrity
-check, per-source counts, and export / import / sync actions).](https://raw.githubusercontent.com/a-attia/scrollback/v0.4.0/assets/screenshots/archive.png)
+check, per-source counts, and export / import / sync actions).](https://raw.githubusercontent.com/a-attia/scrollback/v0.5.0/assets/screenshots/archive.png)
 
 What it offers:
 
@@ -338,7 +351,7 @@ pre-fills a content search.
 
 ## Running it as an app
 
-You don't have to type a command every time. After `pip install ".[web]"`:
+You don't have to type a command every time. After installing scrollback:
 
 - **Short commands** are on your `PATH`: `scrollback-web` (a browser tab)
   and `scrollback-app` (a native window).
@@ -471,7 +484,7 @@ core of the design, and it is enforced:
 ## Development
 
 ```bash
-pip install -e ".[web,dev]"
+pip install -e ".[dev]"
 pytest -q             # tests
 ruff check src tests  # lint
 ```

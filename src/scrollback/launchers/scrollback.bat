@@ -15,5 +15,5 @@ if %errorlevel%==0 (
 )
 
 echo scrollback is not installed.
-echo Install it with:  pip install "scrollback[web]"
+echo Install it with:  pipx install scrollback
 pause

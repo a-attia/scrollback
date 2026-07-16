@@ -34,39 +34,38 @@ classifiers = [
     "Topic :: Software Development",
     "Topic :: Utilities",
 ]
-# Zero required runtime dependencies: the CLI core uses only the stdlib
-# (sqlite3, json, argparse). Optional extras pull in the web app + niceties.
-dependencies = []
+# Runtime dependencies: everything an end user needs for the full
+# experience -- CLI, web app, native app window, and coloured terminal
+# output -- is installed by default. This means `pip install scrollback`
+# (or `pipx install scrollback`) gives you the whole thing out of the box,
+# with no extras to remember.
+#
+# pywebview drives the native app window; on Linux it additionally needs a
+# system GTK/Qt WebKit backend at runtime, but its absence only disables
+# the native window -- the browser fallback still works.
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "jinja2>=3.1",
+    "pywebview>=5.0",
+    "rich>=13.0",
+]
 
-# The bare package stays dependency-free so `pip install scrollback` works
-# anywhere (incl. headless/Linux servers). The web app pulls its own deps.
-# pywebview is included with [web] so the native app window works out of the
-# box; on Linux it additionally needs a system GTK/Qt WebKit backend, but its
-# absence only disables the native window (the browser fallback still works).
+# Only development/maintenance extras remain. Runtime features are no
+# longer gated behind extras -- see `dependencies` above.
 [project.optional-dependencies]
-web = ["fastapi>=0.110", "uvicorn>=0.29", "jinja2>=3.1", "pywebview>=5.0"]
-app = ["scrollback[web]"]
-rich = ["rich>=13.0"]
-# Everything an end user might want at runtime: the web app + native window
-# (web) and coloured terminal output (rich). Deliberately excludes `dev`,
-# which is test/lint tooling, not a runtime feature.
-all = ["scrollback[web,rich]"]
-# dev is self-sufficient for the full test suite: the web-API tests need
-# fastapi/uvicorn + an HTTP client for Starlette's TestClient (httpx), and
-# the colour-output tests need rich. pywebview is NOT included here -- it
-# needs a system GUI backend that CI runners lack, and no test imports it.
+# dev is self-sufficient for the full test suite. httpx is needed by
+# Starlette's TestClient for the web-API tests; everything else the tests
+# import (fastapi, uvicorn, rich) is already a runtime dependency.
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
-    "rich>=13.0",
-    "fastapi>=0.110",
-    "uvicorn>=0.29",
     "httpx>=0.27",
 ]
 # Tooling to regenerate the README screenshots (maintainers only). Needs a
 # one-time `playwright install chromium` for the headless browser; neither
 # this extra nor the browser binary is required to run scrollback.
-screenshots = ["playwright>=1.40", "rich>=13.0", "scrollback[web]"]
+screenshots = ["playwright>=1.40"]
 
 [project.scripts]
 scrollback = "scrollback.cli:main"

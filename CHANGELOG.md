@@ -6,6 +6,36 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-16
+
+Simpler install: `pipx install scrollback` now ships the full experience
+(CLI + web app + native window + colour) out of the box — no extras to
+pick.
+
+### Changed
+
+- **Simpler install: no more extras to remember.** The web app (FastAPI +
+  uvicorn + jinja2), the native app window (pywebview), and coloured
+  terminal output (rich) are now default runtime dependencies. A plain
+  `pipx install scrollback` (or `pip install scrollback`) gives you the
+  full experience out of the box — CLI, web app, and a double-clickable
+  launcher via `scrollback install-launcher` — with no `[web]` / `[app]`
+  / `[all]` selection step. The `[web]`, `[app]`, `[rich]`, and `[all]`
+  extras have been removed; `[dev]` is retained for test/lint tooling
+  and `[screenshots]` for maintainers regenerating README images.
+- **Docs updated to match.** README now opens with a TL;DR (two
+  commands: `pipx install scrollback` + `scrollback install-launcher`)
+  and the Install / Development sections and launcher error messages
+  drop all references to the removed extras.
+
+### Removed
+
+- **Optional-dependency extras `[web]`, `[app]`, `[rich]`, and `[all]`.**
+  Their contents are now default runtime dependencies. Old install
+  commands like `pip install "scrollback[all]"` still succeed on most
+  resolvers (unknown extras are ignored with a warning) but should be
+  simplified to `pip install scrollback`.
+
 ## [0.4.1] - 2026-07-09
 
 ### Fixed

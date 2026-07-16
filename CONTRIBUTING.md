@@ -8,11 +8,13 @@ tool, and contributions that keep it that way are very welcome.
 ```bash
 git clone https://github.com/a-attia/scrollback
 cd scrollback
-python -m pip install -e ".[web,dev]"   # editable install + web + dev tools
+python -m pip install -e ".[dev]"   # editable install + dev tooling
 ```
 
-The bare package has **no runtime dependencies** (stdlib only); the web app
-and developer tooling come from extras. Requires Python 3.10+.
+Everything a user needs at runtime (the CLI, the web app, the native app
+window, and coloured terminal output) is installed by default with the
+package itself; the `[dev]` extra adds test/lint tooling on top. Requires
+Python 3.10+.
 
 ## Running the checks
 

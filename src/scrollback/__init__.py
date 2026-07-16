@@ -5,4 +5,4 @@ coding agents (opencode, Claude Code, ...) through a common adapter
 interface and lets you list, view, search, and export those sessions.
 """
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"

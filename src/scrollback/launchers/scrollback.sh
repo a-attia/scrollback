@@ -7,6 +7,6 @@ if command -v scrollback >/dev/null 2>&1; then
 elif python3 -c "import scrollback" >/dev/null 2>&1; then
   exec python3 -m scrollback.cli web --window
 else
-  echo "scrollback is not installed. Install with: pip install \"scrollback[web]\""
+  echo "scrollback is not installed. Install with: pipx install scrollback"
   exit 1
 fi

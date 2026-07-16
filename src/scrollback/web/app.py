@@ -34,9 +34,10 @@ try:
     from fastapi.staticfiles import StaticFiles
 except ModuleNotFoundError as exc:  # pragma: no cover - guidance path
     raise SystemExit(
-        "The web app needs FastAPI/uvicorn. Install with:\n"
-        '    pip install "scrollback[web]"\n'
-        "or:\n"
+        "The web app needs FastAPI/uvicorn, which normally ship with scrollback.\n"
+        "If they're missing (e.g. a broken environment), reinstall with:\n"
+        "    pip install --force-reinstall scrollback\n"
+        "or install the packages directly:\n"
         "    pip install fastapi uvicorn"
     ) from exc
 
