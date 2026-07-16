@@ -35,13 +35,15 @@ double-clickable native app:
 
 ```bash
 pipx install scrollback
-scrollback install-launcher        # add --app-bundle on macOS for a .app
+scrollback install-launcher        # both launchers by default (on macOS: .command + .app)
 ```
 
 Then run `scrollback` from your terminal, or double-click the launcher
-(macOS `scrollback.command`, Windows `scrollback.bat`, Linux
-application-menu entry). No extras to pick, no separate `[web]` step —
-everything a user needs is installed by default.
+(on macOS: `~/Desktop/scrollback.command` and `~/Applications/scrollback.app`;
+on Windows: `scrollback.bat`; on Linux: an application-menu entry). Use
+`--desktop` or `--app-bundle` if you want just one. No extras to pick,
+no separate `[web]` step — everything a user needs is installed by
+default.
 
 ## Contents
 
