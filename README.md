@@ -30,19 +30,20 @@ them freely. (The screenshots above use synthetic demo data.)
 
 ## TL;DR
 
-Two commands get you the full experience:
+Two commands, using [`pipx`](https://pipx.pypa.io) (a standard
+installer for Python CLIs — isolated environment, still on your PATH),
+get you the full experience:
 
 ```bash
 pipx install scrollback            # everything: CLI, web UI, native app
 scrollback install-launcher        # + a double-clickable launcher (Desktop + Applications)
 ```
 
-[`pipx`](https://pipx.pypa.io) is recommended (isolated environment,
-still on your PATH); plain `pip install scrollback` works identically
-otherwise. Then run `scrollback` from your terminal, or double-click
-the launcher. Use `--desktop` or `--app-bundle` on `install-launcher`
-if you want just one. No extras to pick, no separate `[web]` step —
-everything a user needs is installed by default.
+Plain `pip install scrollback` works identically if you'd rather share
+your Python environment. Then run `scrollback` from your terminal, or
+double-click the launcher. Use `--desktop` or `--app-bundle` on
+`install-launcher` if you want just one. No extras to pick, no
+separate `[web]` step — everything a user needs is installed by default.
 
 ## Contents
 
