@@ -23,9 +23,16 @@ pytest -q          # the test suite
 ruff check src tests   # lint
 ```
 
-Both must pass before a change is merged. The test suite is fast (~2s) and
+Both must pass before a change is merged. The test suite is fast (~4s) and
 runs against synthetic fixtures plus, where present, your real local data
 (those tests skip gracefully when no data is available).
+
+The lint rule set is stated explicitly in `pyproject.toml` under
+`[tool.ruff.lint]`, and the `dev` extra caps the ruff version. Both are
+deliberate: ruff's *default* rule set grows between releases, so an
+unpinned linter changes what "clean" means without anyone touching the
+code. Widening the rule set is welcome — as its own change, with the
+resulting fixes in their own commit.
 
 ## Project conventions
 

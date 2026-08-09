@@ -59,7 +59,11 @@ dependencies = [
 # import (fastapi, uvicorn, rich) is already a runtime dependency.
 dev = [
     "pytest>=8.0",
-    "ruff>=0.4",
+    # Capped: ruff 0.16 changed which rules are on by default, so an
+    # unbounded range means CI's definition of "lint-clean" drifts under the
+    # project without any code changing. `[tool.ruff.lint] select` states the
+    # rule set explicitly; raise this ceiling deliberately, not by accident.
+    "ruff>=0.4,<0.16",
     "httpx>=0.27",
 ]
 # Tooling to regenerate the README screenshots (maintainers only). Needs a
@@ -94,6 +98,20 @@ artifacts = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+# State the rule set explicitly instead of inheriting ruff's default, which
+# changes between releases: 0.16 widened the default from 59 rules to 413,
+# so CI went red on untouched code the day it shipped. `dev` pins `ruff<0.16`
+# to keep contributors and CI on the same linter, but the version floor alone
+# is not enough -- without this block, raising that ceiling would silently
+# re-import hundreds of rules.
+#
+# These four are ruff's long-standing default (pyflakes + the pycodestyle
+# errors that catch real bugs) and are what this codebase was written
+# against. Widening the set is welcome, but as a deliberate change with its
+# own commit for the resulting fixes -- not as a side effect of an upgrade.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
