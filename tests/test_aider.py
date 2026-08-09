@@ -85,3 +85,39 @@ def test_aider_loads_messages(tmp_path):
     roles = [m.role for m in full.messages]
     assert roles == ["user", "assistant", "user", "assistant"]
     assert "parse_date" in full.messages[1].text
+
+
+def test_last_block_updated_tracks_file_mtime(tmp_path):
+    """The in-progress session must sort by recency, not by when it started.
+
+    Aider's history format only timestamps the "chat started at" marker, so a
+    block has no last-activity time of its own. Using the start time for the
+    still-growing final block buried an actively-used session at the bottom of
+    a date-sorted list.
+    """
+    _project(tmp_path)
+    sessions = sorted(AiderSource(roots=[tmp_path]).list_sessions(),
+                      key=lambda s: s.created)
+    older, newest = sessions
+
+    # The closed block (a later marker follows it) keeps its start time.
+    assert older.updated == older.created
+
+    # The final block is still being appended to -> mtime, which is "now".
+    assert newest.updated > newest.created
+
+
+def test_appending_to_history_changes_the_signature(tmp_path):
+    """Growth must be detectable, or the archive can never refresh the copy."""
+    proj = _project(tmp_path)
+    hist = proj / ".aider.chat.history.md"
+
+    def sig():
+        s = sorted(AiderSource(roots=[tmp_path]).list_sessions(),
+                   key=lambda x: x.created)[-1]
+        return (s.updated, s.message_count)
+
+    before = sig()
+    hist.write_text(hist.read_text() + "\n#### another question\n\nAnother reply.\n",
+                    encoding="utf-8")
+    assert sig() != before

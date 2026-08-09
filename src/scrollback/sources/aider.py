@@ -133,16 +133,20 @@ class AiderSource(Source):
     def list_sessions(self) -> Iterator[Session]:
         for f in _find_history_files(self._roots):
             project = f.parent
-            for blk in _split_sessions(f):
-                yield _session_from_block(blk, project, f, with_messages=False)
+            blocks = _split_sessions(f)
+            for i, blk in enumerate(blocks):
+                yield _session_from_block(blk, project, f, with_messages=False,
+                                          is_last=(i == len(blocks) - 1))
 
     def load_session(self, session_id: str) -> Session | None:
         for f in _find_history_files(self._roots):
             project = f.parent
-            for blk in _split_sessions(f):
+            blocks = _split_sessions(f)
+            for i, blk in enumerate(blocks):
                 sid = _session_id(f, blk["start_raw"], blk["index"])
                 if sid == session_id or sid.startswith(session_id):
-                    return _session_from_block(blk, project, f, with_messages=True)
+                    return _session_from_block(blk, project, f, with_messages=True,
+                                               is_last=(i == len(blocks) - 1))
         return None
 
 
@@ -226,18 +230,34 @@ def _block_messages(block: dict) -> list[Message]:
     return messages
 
 
-def _session_from_block(block: dict, project: Path, path: Path, *, with_messages: bool) -> Session:
+def _session_from_block(
+    block: dict, project: Path, path: Path, *, with_messages: bool, is_last: bool = False
+) -> Session:
     start = _parse_ts(block["start_raw"])
     msgs = _block_messages(block)
     first_user = next((m.text for m in msgs if m.role == "user" and m.text), "")
     title = " ".join(first_user.split())[:60] if first_user else project.name
+    # Aider's history format timestamps only the "chat started at" marker, so a
+    # block has no last-activity time of its own. For the FINAL block -- the one
+    # still being appended to -- the file's mtime is that time, which keeps an
+    # active Aider session sorted by recency instead of by when it began.
+    # Earlier blocks are closed (a later marker follows them), so their start
+    # time is the best available answer and mtime would be plain wrong.
+    updated = start
+    if is_last:
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            if start is None or mtime > start:
+                updated = mtime
+        except OSError:
+            pass
     return Session(
         id=_session_id(path, block["start_raw"], block["index"]),
         source=AiderSource.name,
         title=title or project.name,
         directory=str(project),
         created=start,
-        updated=start,
+        updated=updated,
         message_count=len(msgs),
         messages=tuple(msgs) if with_messages else (),
         raw={"path": str(path)},
