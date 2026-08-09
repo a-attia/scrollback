@@ -6,6 +6,80 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Archived sessions no longer stay stuck on "needs updating".** The vault's
+  change-detection signature was *compared* against the session-listing
+  metadata but *stored* from the freshly-loaded session. For adapters where
+  those two disagree the signature could never converge, so the affected
+  sessions were re-archived on every single sync, permanently showed the
+  "live + stale" badge, and made "Archive all" rewrite hundreds of megabytes
+  each run. The stored signature is now the one that will actually be compared
+  next time; the never-shrink guard tracks the written message count
+  separately (new `archived_message_count` column, migrated automatically).
+- **Claude Code's message count is consistent between listing and loading.**
+  Listing counted every `user`/`assistant` line while loading counted only
+  turns that produce renderable content, so meta turns, tool-result-only turns
+  and empty turns inflated the listed total (~40% of real transcripts were
+  affected). Both paths now apply the same rule. This also corrects session
+  message counts in `stats` and in the session list.
+- **"Deleted from agent" now reports the real number.** The count came from
+  comparing each row's `last_seen_live` against the last-sync timestamp, but
+  those per-row stamps were written *during* the sync and the marker only at
+  the end -- so almost every row looked stale and the card could report an
+  entire vault as deleted while the list it linked to showed a handful.
+  Orphans are now derived from the same fact as the per-session `deleted`
+  badge, and only full syncs (never `sync_one` / batch syncs) advance the
+  new `last_full_sync` marker.
+- **Clicking "deleted from agent" shows the deleted sessions immediately.**
+  The filter ran in the browser over one page of results, but deleted sessions
+  are interleaved by date, so the list usually appeared empty until you
+  scrolled. `GET /api/sessions` accepts `deleted=true` and filters server-side.
+- **`scrollback archive` can detect deleted sessions again.** The CLI passed a
+  store with the vault attached as a readable source, so the vault saw its own
+  contents as "live" and nothing was ever counted as no longer live. Syncs now
+  read live sources only; a reader for a *different* vault still works, which
+  is how `--import` merges.
+- Archive-status fields (`archived`, `archived_only`, `archive_status`) are no
+  longer frozen into the manifest's cached metadata summary, where they went
+  stale as soon as the live copy changed.
+- `sync_many` counts `not_found` keys instead of dropping them, so a bulk
+  archive's reported totals add up to the number of sessions requested.
+- The manifest uses WAL journalling: readers no longer block during a long
+  sync, and a crash mid-sync is far less likely to corrupt the index that
+  points at your archived sessions. Exported vaults are checkpointed first
+  and exclude SQLite's `-wal`/`-shm` sidecars, which are only meaningful
+  beside the database that wrote them.
+- Exporting to an existing `.zip` raises instead of silently overwriting it,
+  matching the directory export. The target of a backup is precious.
+- Aider's in-progress session now tracks the history file's modification time
+  instead of the "chat started at" marker, so an actively-used session sorts
+  by recency rather than by when it began. Earlier (closed) blocks keep their
+  start time, which remains the best available answer for them.
+- The background-job registry is bounded and no longer grows without limit on
+  a long-running server; read-only integrity jobs no longer take the manifest
+  writer lock, so a long scan can't block archive actions behind it.
+
+### Changed
+
+- **The archive landing loads immediately.** Its integrity line now does a
+  presence check (every file exists and is non-empty) instead of parsing the
+  whole vault on every render, which blocked the page for as long as it took
+  to read multiple gigabytes. A full parse is available on demand via a new
+  "run full check" action that runs as a background job, or
+  `POST /api/archive/verify`. `GET /api/archive/verify` accepts `deep=true`
+  for the old behaviour, and the CLI gains `scrollback archive --verify
+  --quick`.
+- **Reading archived sessions is no longer O(file size) per action.** The
+  archive reader answers metadata from the manifest and caches the most
+  recent parse, so showing a header or paging a transcript no longer re-reads
+  the entire session file each time (seconds per page on a large session).
+  Resolving an id or prefix is an indexed lookup rather than a full scan.
+- **Live mode shows archive provenance.** Live is the default mode, and it
+  previously displayed no archive badge at all; sessions there are now tagged
+  archived / stale / not-archived like every other mode, while sessions the
+  agent has deleted stay out of the live view.
+
 ## [0.5.0] - 2026-07-16
 
 Simpler install: `pipx install scrollback` now ships the full experience

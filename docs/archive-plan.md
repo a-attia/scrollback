@@ -244,15 +244,44 @@ Status as of 2026-07-08. Phases 1–4 are **shipped**; Phase 5 is future work.
 
 ### Known follow-ups (post-Phase-4)
 
+Status as of 2026-08-09.
+
 - **Indexed search does not cover archived-only sessions.** The FTS index
   syncs live sources only, so a deleted-but-archived session is found via the
   lexical path but not the fast indexed path. A future enhancement could
-  index the vault.
+  index the vault. *Still open* (PLAN.md milestone M8).
 - **Web UI redesign (view vs. archive split).** The current UI bolts archive
   badges + a filter chip onto the existing single list. A dedicated
   browse-live vs. browse-archive information architecture is planned; see
-  [`ROADMAP.md`](../ROADMAP.md).
-- **Opt-in auto-sync-on-web-launch** (deferred from Phase 4).
+  [`ROADMAP.md`](../ROADMAP.md). *Shipped* — Live / Archive / All is the
+  top-level mode switch, with an archive landing view and web-driven sync.
+- **Opt-in auto-sync-on-web-launch** (deferred from Phase 4). *Still open*
+  (PLAN.md milestone M9); blocked on a scheduling policy that cannot
+  contend with an interactive sync.
+
+### As-built corrections (2026-08-09)
+
+Four defects in the shipped implementation were found by an audit against a
+real 3.4 GB vault. They are recorded here because each contradicts something
+this plan asserts, and the plan is otherwise the design of record.
+
+- **§2 change detection assumed a source's list and load counts agree.**
+  They need not, and for Claude Code they did not. The signature stored must
+  be the one taken from the *listing*, or such sessions never match their own
+  signature and re-archive on every sync forever. The never-shrink guard
+  therefore needs its own column (`archived_message_count`) rather than
+  reusing `message_count`.
+- **§7.3's never-shrink guard was comparing unlike quantities** for the same
+  reason — a load-count against a list-count.
+- **"No longer live" had two definitions.** The aggregate count used a
+  timestamp comparison while the per-session badge used a set difference;
+  they disagreed, so the UI's headline contradicted the list it linked to.
+  The set difference is now authoritative.
+- **A sync could read the vault back into itself.** The CLI composed a store
+  with the archive attached, so every archived session looked live and no
+  session could be detected as deleted. `sync()` now drops a reader pointed
+  at its own vault (but keeps one pointed at a *different* vault, which is
+  how `--import` works).
 
 ---
 

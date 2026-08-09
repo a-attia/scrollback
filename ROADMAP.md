@@ -70,9 +70,19 @@ Full design of record, phasing, and as-built notes:
 [`docs/archive-plan.md`](docs/archive-plan.md). **Phases 1–4 shipped**
 (as of 2026-07-08): the durable vault (`scrollback archive`), lossless
 round-trip, read-back as a first-class source (deduped live-wins), and the
-web badges + archive filter chip. **Phase 5 (multi-machine / cloud sync)
-remains future work.** Remaining follow-ups: web UI view/archive redesign
-(below), indexing the vault for fast search, and opt-in auto-sync.
+web badges + archive filter chip. File-based multi-machine sync (export a
+vault, import it on the other machine, larger/newer copy wins) also
+shipped; **cloud sync remains out of scope by design** (see
+[`PLAN.md`](PLAN.md) "Scope and non-scope").
+
+Remaining follow-ups, tracked as milestones M8–M9 in [`PLAN.md`](PLAN.md):
+
+- **Index the vault for fast search.** Archived sessions are browsable and
+  searchable today, but the FTS index covers live sources only, so
+  searching the vault falls back to a lexical scan.
+- **Opt-in auto-sync**, so keeping history does not depend on remembering
+  to run the command. Blocked on a scheduling policy that cannot contend
+  with an interactive sync — see PLAN.md Open question 2.
 
 ## Web UI redesign: browse-live vs. browse-archive
 
@@ -95,7 +105,10 @@ first-class place, and archiving is CLI-only. Planned:
 This revises the earlier "web is strictly read-only" posture: the web app may
 now write to **your own vault** via explicit action, but **never to your
 agents' data** (the invariant that matters). Design of record:
-[`docs/web-redesign.md`](docs/web-redesign.md). **Planned; not started.**
+[`docs/web-redesign.md`](docs/web-redesign.md). **Shipped in 0.4.0**
+(as of 2026-08-09) — every bullet above is in place. The Live mode also
+carries archive provenance tags, so the discovery path works without
+switching modes.
 
 ## Other ideas
 

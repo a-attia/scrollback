@@ -212,6 +212,7 @@ scrollback archive                        # incremental one-way sync -> vault
 scrollback archive --source opencode      # archive one source only
 scrollback archive --stats                # what's in the vault, per source
 scrollback archive --verify               # check archived files exist + parse
+scrollback archive --verify --quick       # presence-only check (fast on big vaults)
 scrollback archive --dest /path/to/vault  # or set $SCROLLBACK_ARCHIVE
 ```
 
@@ -247,6 +248,19 @@ removes; the vault is not touched unless you ask.
 
 `scrollback archive --stats` prints the vault path, per-source counts, and
 this layout at any time.
+
+#### Checking the archive is intact
+
+```bash
+scrollback archive --verify           # parse every archived file (thorough)
+scrollback archive --verify --quick   # check they exist and are non-empty
+```
+
+The full check reads and re-parses every session, so it detects corruption
+but takes a while on a large vault; `--quick` catches the common failure — a
+file that has gone missing or been truncated — in about a second. The web
+app's archive page shows the quick result on load and offers the full check
+as an explicit action, since it runs in the background there.
 
 #### Backing up or moving the archive
 
@@ -291,9 +305,14 @@ The merge keys on `(source, id)`: sessions only present on A are added, and
 where both machines have the same session the **larger/newer copy wins** (the
 same never-shrink guard as normal archiving, so a merge can never lose
 messages). Run it in either direction — or both — to converge the two vaults.
-For continuous sync, point `$SCROLLBACK_ARCHIVE` at a shared folder
-(Dropbox / iCloud / Syncthing) instead; use one writer at a time to avoid
-`manifest.sqlite` write contention.
+
+Export/import is the recommended way to move a vault, because the export is
+checkpointed and self-contained. Pointing `$SCROLLBACK_ARCHIVE` directly at
+a shared folder (Dropbox / iCloud / Syncthing) also works, but treat it with
+care: `manifest.sqlite` is a live SQLite database, and file-sync tools copy
+its journal sidecars independently of the database itself, which can produce
+a partial copy. Use one writer at a time, and let a sync settle before
+archiving from the other machine.
 
 ## The web app
 
@@ -495,6 +514,20 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for project conventions (the
 read-only invariant, stdlib-first dependencies, platform-agnostic code,
 and how to add a new agent source) and [`CHANGELOG.md`](CHANGELOG.md) for
 what has landed so far.
+
+Where the rest of the documentation lives:
+
+| Document | For |
+|:--|:--|
+| [`PLAN.md`](PLAN.md) | The plan-of-record: architecture, milestones, and the design-decisions log (why things are the way they are) |
+| [`AGENTS.md`](AGENTS.md) | AI coding agents working on this repo — invariants they must not violate |
+| [`ROADMAP.md`](ROADMAP.md) | Planned work, including the research behind unimplemented adapters |
+| `docs/*.md` | Per-feature design records, written before the feature and annotated as-built |
+
+**Using an AI agent on this codebase?** Point it at
+[`AGENTS.md`](AGENTS.md) first. It documents the read-only invariant, the
+archive's change-detection rules, and the test discipline — including two
+classes of bug that have already shipped once and are easy to reintroduce.
 
 ## License
 

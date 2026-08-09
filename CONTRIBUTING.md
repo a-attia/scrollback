@@ -41,6 +41,30 @@ runs against synthetic fixtures plus, where present, your real local data
 - **Tests for fixes.** Bug fixes should come with a regression test;
   numeric/parsing assertions should be backed by a known-correct value.
 
+## Test discipline
+
+Beyond "add a test", two rules have earned their place the hard way.
+
+**Verify the test fails without the fix.** A regression test that passes
+against the unfixed code is not testing what you think it is. The cheap
+check:
+
+```bash
+git stash push -- src/ && pytest -q; git stash pop
+```
+
+**Fakes must be able to express real-world messiness.** Several bugs here
+were invisible for months because every test fake was too well-behaved to
+exhibit them. The clearest example: a `Source` whose `list_sessions()`
+reports a different `message_count` than `load_session()` — which real
+adapters do — breaks archive change-detection, but no fake could produce
+that state, so no test could catch it. `AsymmetricSource` in
+`tests/test_archive.py` exists for exactly this; use it when touching sync.
+
+If you are working on the archive or on a source adapter, read the
+"Signature discipline" section of [`AGENTS.md`](AGENTS.md) first. It
+documents two classes of bug that have already shipped once.
+
 ## Adding a new agent source
 
 Implement the `Source` interface in `src/scrollback/sources/base.py` and
