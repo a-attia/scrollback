@@ -605,3 +605,393 @@ def test_make_store_source_archive_is_valid(monkeypatch, tmp_path):
     store = cli._make_store(_args(source="archive"))
     ids = {s.id for s in store.list_sessions()}
     assert ids == {"s1"}  # only the archived copy (live sources filtered out)
+
+
+# -- asymmetric adapters: list count != load count ---------------------------
+#
+# Every FakeSource above reports the same message_count when listing and when
+# loading. Real adapters do not always: Claude Code counts every user/assistant
+# turn while listing, but only *renderable* ones while loading (tool-result-only
+# and empty turns drop out). The archive's change-detection signature straddles
+# both paths, so this asymmetry is the exact shape that made sessions
+# re-archive on every sync forever. These tests encode the invariant directly.
+
+
+class AsymmetricSource(FakeSource):
+    """A source whose listing count exceeds what `load_session` returns.
+
+    Models Claude Code's meta/empty turns: `list_sessions` advertises
+    `n_msgs + skew` messages, `load_session` yields `n_msgs`.
+    """
+
+    name = "asym"
+
+    def __init__(self, sessions, *, skew=3):
+        super().__init__(sessions)
+        self._skew = skew
+
+    def list_sessions(self):
+        from dataclasses import replace
+        return iter([
+            replace(s, messages=(), message_count=(s.message_count or 0) + self._skew)
+            for s in self._sessions.values()
+        ])
+
+
+def test_sync_converges_when_list_and_load_counts_differ(tmp_path):
+    """An unchanged session must be 'unchanged' on EVERY subsequent sync.
+
+    Regression: the stored signature was recomputed from the loaded session
+    while the comparison used the listed session, so any adapter whose two
+    counts differ re-archived every session on every run -- permanently
+    "stale", and rewriting the whole vault each time.
+    """
+    src = AsymmetricSource([_session("s1", source="asym", n_msgs=4)])
+    store = Store([src])
+    vault = archive.ArchiveStore(tmp_path / "vault")
+
+    assert vault.sync(store)["added"] == 1
+    for _ in range(3):
+        r = vault.sync(store)
+        assert r == {"added": 0, "updated": 0, "unchanged": 1,
+                     "kept_orphan": 0, "kept_shrunk": 0}
+
+
+def test_asymmetric_source_never_reports_stale_after_sync(tmp_path):
+    """The UI's 'needs updating' flag must clear once a session is archived."""
+    src = AsymmetricSource([_session("s1", source="asym", n_msgs=4)])
+    vault_path = tmp_path / "vault"
+    archive.ArchiveStore(vault_path).sync(Store([src]))
+
+    rows = Store([src]).with_archive(vault_path).list_sessions()
+    assert [(s.raw or {}).get("archive_status") for s in rows] == ["archived"]
+
+
+def test_never_shrink_guard_still_fires_for_asymmetric_source(tmp_path):
+    """Comparing written-count to written-count must not disarm the guard."""
+    src = AsymmetricSource([_session("s1", source="asym", n_msgs=6)])
+    store = Store([src])
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(store)
+
+    # Degraded re-read: newer `updated`, but only 2 messages actually load.
+    src._sessions["s1"] = _session("s1", source="asym", n_msgs=2,
+                                   updated=_T0 + timedelta(hours=1))
+    assert vault.sync(store)["kept_shrunk"] == 1
+    restored = archivefmt.from_archive_json(
+        vault._session_file("asym", "s1").read_text(encoding="utf-8"))
+    assert len(restored.messages) == 6
+
+
+# -- orphan counting ---------------------------------------------------------
+
+
+def test_orphan_count_matches_archived_only_rows(tmp_path):
+    """`stats()["orphans"]` must equal the number of `archived_only` sessions.
+
+    Regression: orphans were counted as `last_seen_live < last_sync`, but
+    `last_seen_live` was stamped per-row as the sync loop ran while `last_sync`
+    was written at the end -- so nearly every row compared "older" and the
+    headline count reported the whole vault as deleted, contradicting the
+    drill-down list it linked to.
+    """
+    src = FakeSource([_session(f"s{i}") for i in range(5)])
+    vault_path = tmp_path / "vault"
+    vault = archive.ArchiveStore(vault_path)
+    vault.sync(Store([src]))
+
+    # Nothing deleted yet.
+    assert vault.stats()["orphans"] == 0
+
+    # The agent prunes two sessions.
+    del src._sessions["s1"]
+    del src._sessions["s3"]
+    assert vault.sync(Store([src]))["kept_orphan"] == 2
+
+    archived_only = {
+        s.id for s in Store([src]).with_archive(vault_path).list_sessions()
+        if (s.raw or {}).get("archived_only")
+    }
+    assert archived_only == {"s1", "s3"}
+    assert vault.stats()["orphans"] == len(archived_only)
+    # The explicit live-probe path must agree with the marker-based one.
+    assert vault.stats(live_keys=Store([src]).live_keys())["orphans"] == 2
+
+
+def test_partial_syncs_do_not_inflate_orphan_count(tmp_path):
+    """`sync_one` / `sync_many` must not advance the full-sync marker.
+
+    They only look at the keys they were given, so treating them as evidence
+    about every other session would mark the untouched ones deleted.
+    """
+    src = FakeSource([_session("s1"), _session("s2"), _session("s3")])
+    store = Store([src])
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(store)
+    assert vault.stats()["orphans"] == 0
+
+    # Touch one session well after the full sync.
+    src._sessions["s1"] = _session("s1", n_msgs=9, updated=_T0 + timedelta(hours=2))
+    assert vault.sync_one(store, "fake", "s1") == "updated"
+    assert vault.stats()["orphans"] == 0
+
+    vault.sync_many(store, [("fake", "s2")])
+    assert vault.stats()["orphans"] == 0
+
+
+def test_sync_many_reports_not_found(tmp_path):
+    """A key that no longer resolves is counted, not silently dropped."""
+    store = _store(_session("s1"))
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    r = vault.sync_many(store, [("fake", "s1"), ("fake", "ghost")])
+    assert r["added"] == 1
+    assert r["not_found"] == 1
+    assert sum(r.values()) == 2  # every requested key accounted for
+
+
+# -- vault must not read itself back -----------------------------------------
+
+
+def test_sync_ignores_a_reader_for_its_own_vault(tmp_path):
+    """Deleted sessions stay detectable even when the store carries the vault.
+
+    The CLI attaches an `ArchiveSource` so deleted sessions remain browsable;
+    feeding that back into a sync let the vault see itself as a live source, so
+    `kept_orphan` was always 0 and orphans were re-stamped as live forever.
+    """
+    src = FakeSource([_session("s1"), _session("gone")])
+    vault_path = tmp_path / "vault"
+    vault = archive.ArchiveStore(vault_path)
+    vault.sync(Store([src]))
+
+    del src._sessions["gone"]
+    # A browsing-shaped store: live sources PLUS this vault.
+    composed = Store([src]).with_archive(vault_path)
+    assert vault.sync(composed)["kept_orphan"] == 1
+    assert vault.stats()["orphans"] == 1
+
+
+def test_summary_json_omits_volatile_provenance(tmp_path):
+    """Archive-status fields must not be frozen into the stored summary.
+
+    They describe the vault relationship *now*; a cached value goes stale the
+    moment the live copy changes.
+    """
+    import json
+
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(_store(_session("s1")))
+    with vault._connect(write=False) as conn:
+        raw = conn.execute("SELECT meta_json FROM archived").fetchone()[0]
+    stored = json.loads(raw)
+    for volatile in ("archived", "archived_only", "archive_status"):
+        assert volatile not in stored
+
+
+# -- read-back adapter: windowed + indexed access ----------------------------
+#
+# An archive file is one JSON document, so a naive read-back parses the whole
+# thing for every access. The base-class defaults did exactly that: showing a
+# header, or paging a transcript, re-parsed the entire session each time --
+# seconds per page on a large one. These tests pin the cheap paths.
+
+
+def _archive_reader(tmp_path, *sessions):
+    from scrollback.sources.archive import ArchiveSource
+
+    vp = tmp_path / "vault"
+    archive.ArchiveStore(vp).sync(_store(*sessions))
+    return ArchiveSource(vp)
+
+
+def test_archive_reader_meta_does_not_parse_the_file(tmp_path, monkeypatch):
+    """`load_session_meta` must answer from the manifest, not the session file."""
+    reader = _archive_reader(tmp_path, _session("s1", n_msgs=5))
+
+    def boom(*_a, **_k):
+        raise AssertionError("load_session_meta parsed the session file")
+
+    monkeypatch.setattr(reader, "_read_file", boom)
+    meta = reader.load_session_meta("s1")
+    assert meta is not None
+    assert meta.id == "s1" and meta.message_count == 5
+    assert meta.messages == ()
+
+
+def test_archive_reader_pages_parse_the_file_once(tmp_path, monkeypatch):
+    """Paging a transcript must not re-parse the whole file per page.
+
+    The JSON parse is what costs seconds on a large session, so that is what
+    is counted here -- not the number of `_read_file` calls, which are cheap
+    cache probes.
+    """
+    from scrollback.sources import archive as archive_src
+
+    reader = _archive_reader(tmp_path, _session("s1", n_msgs=10))
+    calls = {"n": 0}
+    real = archive_src.archivefmt.from_archive_json
+
+    def counting(text):
+        calls["n"] += 1
+        return real(text)
+
+    monkeypatch.setattr(archive_src.archivefmt, "from_archive_json", counting)
+    pages = [reader.load_messages("s1", offset=o, limit=4) for o in (0, 4, 8)]
+    assert [len(p) for p in pages] == [4, 4, 2]
+    assert [m.id for m in pages[0]] == [f"s1-m{i}" for i in range(4)]
+    assert calls["n"] == 1  # parsed once, reused across pages
+
+
+def test_archive_reader_cache_invalidates_on_change(tmp_path):
+    """A refreshed archive copy must never be served from the stale cache."""
+    src = FakeSource([_session("s1", n_msgs=2)])
+    vp = tmp_path / "vault"
+    vault = archive.ArchiveStore(vp)
+    vault.sync(Store([src]))
+
+    from scrollback.sources.archive import ArchiveSource
+    reader = ArchiveSource(vp)
+    assert len(reader.load_messages("s1")) == 2
+
+    src._sessions["s1"] = _session("s1", n_msgs=7, updated=_T0 + timedelta(hours=1))
+    vault.sync(Store([src]))
+    assert len(reader.load_messages("s1")) == 7
+
+
+def test_archive_reader_resolves_ids_and_prefixes(tmp_path):
+    reader = _archive_reader(
+        tmp_path,
+        _session("abc123", updated=_T0),
+        _session("abc999", updated=_T0 + timedelta(hours=1)),
+        _session("zz", updated=_T0 - timedelta(hours=1)),
+    )
+    assert reader.resolve_session_id("abc123") == "abc123"
+    assert reader.resolve_session_id("zz") == "zz"
+    assert reader.resolve_session_id("abc") is None      # ambiguous prefix
+    assert reader.resolve_session_id("abc9") == "abc999"  # unique prefix
+    assert reader.resolve_session_id("nope") is None
+    assert reader.resolve_session_id("latest") == "abc999"
+
+
+def test_archive_reader_prefix_treats_underscore_literally(tmp_path):
+    """`_` is a LIKE wildcard; ids contain it, so it must be escaped."""
+    reader = _archive_reader(tmp_path, _session("ses_a1"), _session("sesXa1"))
+    assert reader.resolve_session_id("ses_") == "ses_a1"
+
+
+# -- integrity check: shallow vs deep ---------------------------------------
+
+
+def test_verify_shallow_skips_parsing_but_finds_missing(tmp_path):
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(_store(_session("s1"), _session("s2")))
+
+    # Corrupt s1's contents; a shallow check cannot see it, a deep one must.
+    vault._session_file("fake", "s1").write_text("{not json", encoding="utf-8")
+    quick = vault.verify(deep=False)
+    assert len(quick["ok"]) == 2 and quick["unreadable"] == []
+    deep = vault.verify(deep=True)
+    assert deep["unreadable"] == ["fake:s1"] and len(deep["ok"]) == 1
+
+    # A truncated (empty) file counts as missing even in the shallow check.
+    vault._session_file("fake", "s2").write_text("", encoding="utf-8")
+    assert vault.verify(deep=False)["missing"] == ["fake:s2"]
+
+
+def test_verify_reports_progress(tmp_path):
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(_store(_session("s1"), _session("s2"), _session("s3")))
+    seen = []
+    vault.verify(deep=True, progress=lambda d, t: seen.append((d, t)))
+    assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_backfill_meta_preserves_the_listing_signature(tmp_path):
+    """Backfill must copy the manifest's signature, not the loaded counts.
+
+    Otherwise a vault backfilled from an asymmetric adapter reads back as
+    permanently stale -- the same defect as in `_archive_session`.
+    """
+    import json
+
+    src = AsymmetricSource([_session("s1", source="asym", n_msgs=4)])
+    vault_path = tmp_path / "vault"
+    vault = archive.ArchiveStore(vault_path)
+    vault.sync(Store([src]))
+
+    # Simulate a vault archived before `meta_json` existed.
+    with vault._connect(write=True) as conn:
+        conn.execute("UPDATE archived SET meta_json = NULL")
+    assert vault.backfill_meta() == 1
+
+    with vault._connect(write=False) as conn:
+        stored = json.loads(conn.execute("SELECT meta_json FROM archived").fetchone()[0])
+    listed = next(iter(src.list_sessions()))
+    assert stored["message_count"] == listed.message_count
+
+    rows = Store([src]).with_archive(vault_path).list_sessions()
+    assert [(s.raw or {}).get("archive_status") for s in rows] == ["archived"]
+
+
+# -- WAL sidecars must never travel with an exported vault -------------------
+
+
+def _dirty_wal(vault):
+    """Leave a committed-but-not-checkpointed write in the manifest's WAL."""
+    import sqlite3
+
+    conn = sqlite3.connect(vault.manifest_path)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('probe', 'x')")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_zip_export_excludes_sqlite_sidecars(tmp_path):
+    """A `-wal`/`-shm` file is only valid beside the DB that wrote it.
+
+    Shipping them inside a backup gives the recipient a manifest that is
+    either stale or refuses to open.
+    """
+    import zipfile
+
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(_store(_session("s1"), _session("s2")))
+    _dirty_wal(vault)
+
+    dest = tmp_path / "backup.zip"
+    vault.export_to(dest)
+    names = zipfile.ZipFile(dest).namelist()
+    assert not [n for n in names if n.endswith(("-wal", "-shm", "-journal"))]
+    assert "manifest.sqlite" in names
+
+    # The checkpointed copy is complete: re-importing recovers both sessions.
+    merged = archive.ArchiveStore(tmp_path / "restored")
+    assert merged.import_from(dest)["added"] == 2
+
+
+def test_dir_export_excludes_sqlite_sidecars(tmp_path):
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(_store(_session("s1")))
+    _dirty_wal(vault)
+
+    dest = tmp_path / "copy"
+    vault.export_to(dest)
+    assert sorted(p.name for p in dest.iterdir()) == ["manifest.sqlite", "sessions"]
+    assert archive.ArchiveStore(tmp_path / "restored").import_from(dest)["added"] == 1
+
+
+def test_zip_export_refuses_to_overwrite(tmp_path):
+    """The target of a backup is, by definition, precious."""
+    import pytest
+
+    vault = archive.ArchiveStore(tmp_path / "vault")
+    vault.sync(_store(_session("s1")))
+    dest = tmp_path / "backup.zip"
+    dest.write_text("existing backup", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        vault.export_to(dest)
+    assert dest.read_text(encoding="utf-8") == "existing backup"

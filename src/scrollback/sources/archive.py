@@ -28,6 +28,16 @@ from ..models import Session
 from .base import Source
 
 
+def _like_prefix(selector: str) -> str:
+    """Build a LIKE pattern matching `selector` as a literal prefix.
+
+    Session ids can legitimately contain `_`, which is a LIKE wildcard, so the
+    selector is escaped before the trailing `%` is appended.
+    """
+    escaped = selector.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "%"
+
+
 class ArchiveSource(Source):
     """Read-only adapter over a vault directory.
 
@@ -43,6 +53,8 @@ class ArchiveSource(Source):
         from ..archive import ArchiveStore
 
         self._store = ArchiveStore(Path(vault_path))
+        # Most-recently-parsed session: ((path, mtime_ns, size), Session).
+        self._cache: tuple[tuple[str, int, int], Session] | None = None
 
     # -- discovery ----------------------------------------------------------
 
@@ -79,18 +91,55 @@ class ArchiveSource(Source):
                 )
             ]
 
+    def _row_for(self, session_id: str) -> tuple[str, str, str] | None:
+        """Look up one manifest row by session id, or None.
+
+        Queried directly rather than scanning every row: the manifest is keyed
+        on ``(source, id)`` and a vault holds thousands of sessions. Ids are
+        unique within a source, so a bare id may match rows from more than one
+        source; the first is returned, mirroring the base-class resolver.
+        """
+        if not self._store.exists():
+            return None
+        with self._store._connect(write=False) as conn:
+            r = conn.execute(
+                "SELECT source, session_id, file_path FROM archived "
+                "WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return (r["source"], r["session_id"], r["file_path"]) if r else None
+
     def _read_file(self, rel_path: str) -> Session | None:
+        """Parse one archived session file, with a one-entry cache.
+
+        Archived sessions are single JSON documents, so any read costs a full
+        parse -- and the web UI pages through a transcript, calling this once
+        per page. Caching the most recent parse turns K pages over one session
+        from K full parses into one (a 583 MB session took ~3 s *per page*
+        without it). One entry is enough: reads are overwhelmingly repeated
+        against the session currently open. The cache is keyed on the file's
+        mtime+size, so an updated archive copy is never served stale.
+        """
         path = self._store.safe_path(rel_path)   # rejects traversal outside the vault
         if path is None:
             return None
+        try:
+            st = path.stat()
+            sig = (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+        if self._cache is not None and self._cache[0] == sig:
+            return self._cache[1]
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             return None
         try:
-            return archivefmt.from_archive_json(text)
+            sess = archivefmt.from_archive_json(text)
         except (ValueError, KeyError):
             return None
+        self._cache = (sig, sess)
+        return sess
 
     # -- Source contract ----------------------------------------------------
 
@@ -150,11 +199,91 @@ class ArchiveSource(Source):
         """
         from dataclasses import replace
 
-        for _source, sid, rel in self._manifest_rows():
-            if sid == session_id:
-                sess = self._read_file(rel)
-                if sess is None:
-                    return None
-                raw = {**(sess.raw or {}), "archived": True}
-                return replace(sess, raw=raw)
-        return None
+        row = self._row_for(session_id)
+        if row is None:
+            return None
+        sess = self._read_file(row[2])
+        if sess is None:
+            return None
+        return replace(sess, raw={**(sess.raw or {}), "archived": True})
+
+    def load_session_meta(self, session_id: str) -> Session | None:
+        """Metadata only, read from the manifest's stored summary.
+
+        Overridden so a header render costs one indexed SQLite lookup instead
+        of the base class's parse-everything-then-discard-messages -- which on
+        a large archived session meant parsing hundreds of megabytes to show a
+        title. Falls back to the file for rows predating `meta_json`.
+        """
+        import json as _json
+        from dataclasses import replace
+
+        if not self._store.exists():
+            return None
+        with self._store._connect(write=False) as conn:
+            r = conn.execute(
+                "SELECT file_path, meta_json FROM archived "
+                "WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if r is None:
+            return None
+        if r["meta_json"]:
+            try:
+                return self._session_from_summary(_json.loads(r["meta_json"]))
+            except (ValueError, KeyError):
+                pass
+        sess = self._read_file(r["file_path"])
+        if sess is None:
+            return None
+        return replace(sess, messages=(), raw={**(sess.raw or {}), "archived": True})
+
+    def load_messages(self, session_id: str, *, offset: int = 0, limit=None):
+        """A window of one archived session's messages.
+
+        An archive file is a single JSON document, so unlike the JSONL adapters
+        there is no way to seek to the Nth message -- the whole file must be
+        parsed. The override still matters: it goes through `_read_file`'s
+        cache, so paging through a transcript parses once rather than once per
+        page.
+        """
+        sess = self.load_session(session_id)
+        if sess is None:
+            return []
+        msgs = list(sess.messages)
+        if offset:
+            msgs = msgs[offset:]
+        if limit is not None:
+            msgs = msgs[:limit]
+        return msgs
+
+    def resolve_session_id(self, selector: str) -> str | None:
+        """Resolve an id / unique prefix / 'latest' against the manifest.
+
+        Overridden to query SQLite instead of the base class's full
+        `list_sessions()` scan, which would materialise every archived session
+        just to match one id.
+        """
+        selector = selector.strip()
+        if not self._store.exists():
+            return None
+        with self._store._connect(write=False) as conn:
+            if selector == "latest":
+                r = conn.execute(
+                    "SELECT session_id FROM archived "
+                    "WHERE updated IS NOT NULL ORDER BY updated DESC LIMIT 1"
+                ).fetchone()
+                return r["session_id"] if r else None
+            r = conn.execute(
+                "SELECT session_id FROM archived WHERE session_id = ? LIMIT 1",
+                (selector,),
+            ).fetchone()
+            if r is not None:
+                return r["session_id"]
+            # Unique-prefix match. Fetch two: more than one hit is ambiguous.
+            rows = conn.execute(
+                "SELECT DISTINCT session_id FROM archived "
+                "WHERE session_id LIKE ? ESCAPE '\\' LIMIT 2",
+                (_like_prefix(selector),),
+            ).fetchall()
+        return rows[0]["session_id"] if len(rows) == 1 else None

@@ -435,7 +435,6 @@ def _scan_metadata(path: Path) -> dict[str, Any] | None:
             if new_title:
                 title = new_title
         if t in ("user", "assistant"):
-            msg_count += 1
             ts = obj.get("timestamp")
             if ts:
                 if first_ts is None:
@@ -454,6 +453,15 @@ def _scan_metadata(path: Path) -> dict[str, Any] | None:
                     tok_out += _int(u.get("output_tokens"))
                     tok_cache_read += _int(u.get("cache_read_input_tokens"))
                     tok_cache_write += _int(u.get("cache_creation_input_tokens"))
+            # Count exactly the turns `_parse_session` / `load_messages` will
+            # actually yield: not meta, and carrying at least one renderable
+            # part. Counting every user/assistant line instead made the listing
+            # count disagree with the loaded count on ~40% of real transcripts
+            # (tool-result-only turns, empty content), which in turn made the
+            # archive's change-detection signature never converge.
+            if not obj.get("isMeta") and isinstance(m, dict):
+                if _content_to_parts("probe", m.get("content")):
+                    msg_count += 1
             if (
                 first_user_text is None
                 and t == "user"

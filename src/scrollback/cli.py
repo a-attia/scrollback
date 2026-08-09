@@ -414,7 +414,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
         if not store.exists():
             _eprint(f"no archive at {store.path}; run 'scrollback archive' to create one")
             return 1
-        s = store.stats()
+        # Compare against the live sources directly, so "no longer live" is an
+        # exact set difference rather than an inference from the last sync.
+        s = store.stats(live_keys=Store().live_keys())
         print(f"archive: {store.path}")
         print(f"sessions: {s['sessions']}   no longer live: {s['orphans']}")
         for src, n in sorted(s.get("per_source", {}).items()):
@@ -433,10 +435,15 @@ def cmd_archive(args: argparse.Namespace) -> int:
         if not store.exists():
             _eprint(f"no archive at {store.path}; nothing to verify")
             return 1
-        v = store.verify()
+        deep = not getattr(args, "quick", False)
+        v = store.verify(deep=deep)
         print(f"archive: {store.path}")
-        print(f"ok: {len(v['ok'])}   missing: {len(v['missing'])}   "
-              f"unreadable: {len(v['unreadable'])}")
+        if deep:
+            print(f"ok: {len(v['ok'])}   missing: {len(v['missing'])}   "
+                  f"unreadable: {len(v['unreadable'])}")
+        else:
+            print(f"present: {len(v['ok'])}   missing: {len(v['missing'])}"
+                  "   (quick check; re-run without --quick to parse each file)")
         for label in v["missing"]:
             _eprint(f"  missing file: {label}")
         for label in v["unreadable"]:
@@ -482,7 +489,9 @@ def cmd_archive(args: argparse.Namespace) -> int:
         _eprint(msg)
         return 0
 
-    live = _make_store(args)
+    # Live sources ONLY: archiving must never read the vault back into itself
+    # (that would mask every deleted session as still-live).
+    live = _make_store(args, with_archive=False)
     if not live.sources:
         _eprint("no sources available to archive")
         return 1
@@ -507,7 +516,15 @@ class _BadSource(Exception):
     """Raised when an unknown --source name is given."""
 
 
-def _make_store(args: argparse.Namespace) -> Store:
+def _make_store(args: argparse.Namespace, *, with_archive: bool = True) -> Store:
+    """Build the store for a command.
+
+    `with_archive` attaches the durable vault as a readable source, so archived
+    -- including agent-deleted -- sessions show up in browsing commands. Pass
+    False for commands that WRITE the vault (`archive`): a sync must read live
+    sources only, or the vault sees itself and no session can be detected as
+    deleted.
+    """
     store = Store()
     name = getattr(args, "source", None)
     if name:
@@ -519,6 +536,8 @@ def _make_store(args: argparse.Namespace) -> Store:
         # "archive" is not a live adapter; with_sources([]) drops live sources
         # and the archive reader is added below, giving an archive-only view.
         store = store.with_sources([] if name == "archive" else [name])
+    if not with_archive:
+        return store
     # Make archived sessions -- including ones the agent has deleted -- a
     # first-class readable source when a vault exists (no-op otherwise).
     # Deduped live-wins, so this never changes what a live session shows.
@@ -1336,6 +1355,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="show vault stats + layout and exit (no sync)")
     sp.add_argument("--verify", action="store_true",
                     help="check archived files exist and parse; exit (no sync)")
+    sp.add_argument("--quick", action="store_true",
+                    help="with --verify: only check files exist and are "
+                         "non-empty, skipping the parse of every file "
+                         "(seconds instead of minutes on a large vault)")
     sp.add_argument("--export", metavar="DEST",
                     help="export the vault for backup / another machine, to a "
                          "directory or a .zip (no sync)")

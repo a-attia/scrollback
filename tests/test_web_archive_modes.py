@@ -179,6 +179,55 @@ def test_archive_overview_has_disk_and_stale(tmp_path):
     assert c.get("/api/archive").json()["stale"] == 1
 
 
+def test_orphan_count_matches_deleted_drilldown(tmp_path):
+    """The 'deleted from agent' card and the list it links to must agree.
+
+    Regression: the card counted rows whose `last_seen_live` predated the last
+    sync (nearly all of them, since those timestamps were written per-row as
+    the sync ran), while the list showed `archived_only` rows. The headline
+    said hundreds; the list showed a handful.
+    """
+    src = FakeSource([_session(f"s{i}") for i in range(6)])
+    c = _client(tmp_path, src)
+    _sync_all(c)
+    assert c.get("/api/archive").json()["orphans"] == 0
+
+    # The agent prunes two sessions.
+    del src._sessions["s2"]
+    del src._sessions["s4"]
+
+    orphans = c.get("/api/archive").json()["orphans"]
+    listed = {
+        s["id"]
+        for s in c.get("/api/sessions?mode=archive&deleted=true&limit=2000").json()["sessions"]
+    }
+    assert listed == {"s2", "s4"}
+    assert orphans == len(listed)
+
+
+def test_deleted_filter_is_applied_server_side(tmp_path):
+    """`deleted=true` must find deleted sessions beyond the first page.
+
+    They are interleaved by date with everything else, so a client-side filter
+    over one page of results would show an empty list.
+    """
+    # 40 sessions; the deleted one is the OLDEST, so it sorts last.
+    sessions = [
+        _session(f"s{i:02d}", updated=_T0.replace(minute=i)) for i in range(40)
+    ]
+    src = FakeSource(sessions)
+    c = _client(tmp_path, src)
+    _sync_all(c)
+    del src._sessions["s00"]
+
+    first_page = c.get("/api/sessions?mode=archive&limit=10").json()["sessions"]
+    assert "s00" not in {s["id"] for s in first_page}   # not on page 1
+
+    data = c.get("/api/sessions?mode=archive&deleted=true&limit=10").json()
+    assert [s["id"] for s in data["sessions"]] == ["s00"]
+    assert data["has_more"] is False
+
+
 def test_archive_verify_endpoint(tmp_path):
     c = _client(tmp_path, FakeSource([_session("s1")]))
     assert c.get("/api/archive/verify").json() == {"exists": False}
@@ -333,3 +382,71 @@ def test_job_events_unknown_id_404(tmp_path):
     c = _client(tmp_path, FakeSource([_session("s1")]))
     assert c.get("/api/archive/jobs/nope/events").status_code == 404
     assert c.get("/api/archive/jobs/nope").status_code == 404
+
+
+# -- integrity endpoint: cheap by default, deep on demand --------------------
+
+
+def test_verify_endpoint_is_shallow_by_default(tmp_path):
+    """The landing's integrity line must not parse the whole vault.
+
+    Deep verification reads every archived file; doing that inline on each
+    archive-landing render blocked the page for as long as it took.
+    """
+    c = _client(tmp_path, FakeSource([_session("s1"), _session("s2")]))
+    _sync_all(c)
+
+    from scrollback.archive import ArchiveStore
+    vault = ArchiveStore(tmp_path / "vault")
+    vault._session_file("fake", "s1").write_text("{corrupt", encoding="utf-8")
+
+    shallow = c.get("/api/archive/verify").json()
+    assert shallow["deep"] is False
+    assert shallow["ok"] == 2 and shallow["unreadable"] == []
+
+    deep = c.get("/api/archive/verify?deep=true").json()
+    assert deep["deep"] is True and deep["unreadable"] == ["fake:s1"]
+
+
+def test_deep_verify_runs_as_a_background_job(tmp_path):
+    c = _client(tmp_path, FakeSource([_session("s1"), _session("s2")]))
+    _sync_all(c)
+    j = c.post("/api/archive/verify").json()
+    for _ in range(100):
+        snap = c.get(f"/api/archive/jobs/{j['job_id']}").json()
+        if snap["finished"]:
+            break
+        time.sleep(0.02)
+    assert snap["finished"] and snap["error"] is None
+    assert snap["result"] == {"ok": 2, "missing": 0, "unreadable": 0}
+
+
+# -- live mode still shows archive provenance --------------------------------
+
+
+def test_live_mode_annotates_archive_status(tmp_path):
+    """Live is the default mode; a session archived there must say so.
+
+    It must NOT, however, surface vault-only sessions -- those are gone from
+    the agent, so they do not belong in a view of live sessions.
+    """
+    src = FakeSource([_session("s1"), _session("gone")])
+    c = _client(tmp_path, src)
+
+    before = c.get("/api/sessions?mode=live").json()["sessions"]
+    assert {s["archive_status"] for s in before} == {"none"}
+
+    _sync_all(c)
+    after = {s["id"]: s for s in c.get("/api/sessions?mode=live").json()["sessions"]}
+    assert after["s1"]["archive_status"] == "archived"
+
+    # A live session that has since grown reads back as stale, not archived.
+    src._sessions["s1"] = _session("s1", n_msgs=9, updated=_T0.replace(hour=5))
+    live = {s["id"]: s for s in c.get("/api/sessions?mode=live").json()["sessions"]}
+    assert live["s1"]["archive_status"] == "stale"
+
+    # Deleted-from-agent sessions stay out of live mode, but remain in all.
+    del src._sessions["gone"]
+    ids = {s["id"] for s in c.get("/api/sessions?mode=live").json()["sessions"]}
+    assert "gone" not in ids
+    assert "gone" in {s["id"] for s in c.get("/api/sessions?mode=all").json()["sessions"]}

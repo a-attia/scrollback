@@ -27,6 +27,7 @@ GET  /api/archive/jobs/{job_id}/events     -> SSE progress for a sync job
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 try:
@@ -96,31 +97,40 @@ class _JobRegistry:
     def get(self, job_id: str) -> "_SyncJob | None":
         return self._jobs.get(job_id)
 
-    def start(self, kind: str, work) -> _SyncJob:
+    #: Finished jobs kept for status polling before the oldest are dropped.
+    #: Bounded so a long-lived server cannot accumulate them without limit.
+    _MAX_JOBS = 64
+
+    def start(self, kind: str, work, *, writes: bool = True) -> _SyncJob:
         """Register a job and run `work(job)` in a daemon thread.
 
-        ALL sync jobs write the manifest (a single SQLite file), so they must
-        not run concurrently. If any job is already active, a same-`kind`
-        request returns the running job (single-flight); otherwise the new job
-        waits on `_writer_lock` so writers are serialized (never two at once).
+        Jobs that write the manifest (a single SQLite file) must not run
+        concurrently: they take `_writer_lock`, so writers are serialized. If a
+        job of the same `kind` is already active, that running job is returned
+        instead of starting a second one (single-flight).
+
+        `writes=False` marks a read-only job (integrity verification). Those
+        skip the writer lock -- holding it would make a multi-minute vault scan
+        block every archive action behind it, for no safety benefit, since
+        SQLite readers and a WAL writer coexist happily.
         """
         import threading
         import uuid
 
         with self._lock:
-            if self._active:
-                existing = self._jobs.get(self._active)
-                if existing and not existing.finished.is_set() and existing.kind == kind:
+            for existing in self._jobs.values():
+                if existing.kind == kind and not existing.finished.is_set():
                     return existing  # coalesce identical concurrent requests
             job = _SyncJob(uuid.uuid4().hex, kind)
             self._jobs[job.id] = job
+            self._evict_locked()
 
         def run() -> None:
-            # Serialize all manifest writers: one at a time, no concurrent
-            # SQLite write handles on the same DB.
-            with self._writer_lock:
-                with self._lock:
-                    self._active = job.id
+            lock = self._writer_lock if writes else contextlib.nullcontext()
+            with lock:
+                if writes:
+                    with self._lock:
+                        self._active = job.id
                 try:
                     work(job)
                 except Exception as exc:  # keep the failure visible to the client
@@ -134,6 +144,18 @@ class _JobRegistry:
 
         threading.Thread(target=run, daemon=True).start()
         return job
+
+    def _evict_locked(self) -> None:
+        """Drop the oldest FINISHED jobs once the registry is over budget.
+
+        Called with `_lock` held. Running jobs are never evicted -- their
+        clients are still polling them.
+        """
+        if len(self._jobs) <= self._MAX_JOBS:
+            return
+        done = [jid for jid, j in self._jobs.items() if j.finished.is_set()]
+        for jid in done[: len(self._jobs) - self._MAX_JOBS]:
+            del self._jobs[jid]
 
 
 def _default_store() -> Store:
@@ -238,10 +260,14 @@ def create_app(
         """
         mode = mode if mode in ("live", "archive", "all") else "all"
         if mode == "live":
-            # Live is the default + hot path: keep it live-only so it never pays
-            # the archive read cost. (Archive-status tags still show accurately
-            # in All / Archive modes.)
-            return _live_store
+            # Live = the agent's own sessions only, but still annotated with
+            # their archive status, so the "archived / live + stale" tag means
+            # the same thing in every mode. `hide_archived_only` drops the
+            # vault-only (deleted) sessions that composing with the archive
+            # would otherwise surface here. Without this the default mode --
+            # the one most users only ever see -- showed no archive badge at
+            # all. No-op when no vault exists.
+            return _live_store.with_archive(_vault_path, hide_archived_only=True)
         if mode == "archive":
             # Live sources dropped; only the vault reader remains. Pass the live
             # session keys as a probe so a still-live archived session is
@@ -332,6 +358,7 @@ def create_app(
         since: str | None = None,
         until: str | None = None,
         fold: bool = True,
+        deleted: bool = False,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=60, ge=1, le=2000),
     ) -> dict[str, Any]:
@@ -345,14 +372,30 @@ def create_app(
         known = {s.name for s in _live_store.sources} | {s.name for s in registry.all_sources()}
         if source and source not in known:
             raise HTTPException(status_code=400, detail=f"unknown source: {source}")
-        # Fetch one extra to tell the client whether more pages exist.
-        rows = base.list_sessions(
-            source=source, directory=dir, query=q,
-            since=_parse_dt(since), until=_parse_dt(until),
-            offset=offset, limit=limit + 1, fold_subagents=fold,
-        )
-        has_more = len(rows) > limit
-        rows = rows[:limit]
+        # `deleted=true` keeps only sessions that survive ONLY in the vault.
+        # Filtering here rather than in the browser matters: the deleted ones
+        # are ordered by date among everything else, so a client-side filter on
+        # a 50-row page shows nothing until the user scrolls past them.
+        if deleted:
+            rows = [
+                s for s in base.list_sessions(
+                    source=source, directory=dir, query=q,
+                    since=_parse_dt(since), until=_parse_dt(until),
+                    fold_subagents=fold,
+                )
+                if (s.raw or {}).get("archived_only")
+            ]
+            has_more = len(rows) > offset + limit
+            rows = rows[offset:offset + limit]
+        else:
+            # Fetch one extra to tell the client whether more pages exist.
+            rows = base.list_sessions(
+                source=source, directory=dir, query=q,
+                since=_parse_dt(since), until=_parse_dt(until),
+                offset=offset, limit=limit + 1, fold_subagents=fold,
+            )
+            has_more = len(rows) > limit
+            rows = rows[:limit]
         return {
             "sessions": [session_summary(s) for s in rows],
             "offset": offset,
@@ -522,7 +565,11 @@ def create_app(
         vault = _archive_mod.ArchiveStore(_vault_path)
         if not vault.exists():
             return {"exists": False, "path": str(_vault_path)}
-        s = vault.stats()
+        # Pass the authoritative live key set so the "deleted from agent" count
+        # is derived from the same fact as the `archived_only` flag on the rows
+        # the drill-down shows. Deriving them separately let the headline number
+        # and the list it links to disagree.
+        s = vault.stats(live_keys=_live_store.live_keys())
         # Count stale sessions (still live but archived copy out of date) from
         # the deduped "all" view, so the landing can offer "update all stale".
         stale = sum(
@@ -540,14 +587,40 @@ def create_app(
         }
 
     @app.get("/api/archive/verify")
-    def api_archive_verify() -> dict[str, Any]:
-        """Integrity check: counts of ok / missing / unreadable archived files."""
+    def api_archive_verify(deep: bool = False) -> dict[str, Any]:
+        """Integrity check: counts of ok / missing / unreadable archived files.
+
+        Defaults to the SHALLOW check (stat only), because this is called on
+        every archive-landing render and the deep check reads the entire vault
+        -- tens of seconds on a large one, with the page blocked throughout.
+        `deep=true` runs the full parse; prefer the background job endpoint
+        below for that, so the request does not hold a worker open.
+        """
         vault = _archive_mod.ArchiveStore(_vault_path)
         if not vault.exists():
             return {"exists": False}
-        v = vault.verify()
-        return {"exists": True, "ok": len(v["ok"]),
+        v = vault.verify(deep=deep)
+        return {"exists": True, "deep": deep, "ok": len(v["ok"]),
                 "missing": v["missing"], "unreadable": v["unreadable"]}
+
+    @app.post("/api/archive/verify")
+    def api_archive_verify_deep() -> dict[str, Any]:
+        """Start a full (deep) integrity check as a background job.
+
+        Returns a `job_id`; watch it on the same SSE events endpoint the sync
+        jobs use. Parsing the whole vault can take a long time, so it must not
+        run inline on a request.
+        """
+        vault = _archive_mod.ArchiveStore(_vault_path)
+
+        def work(job: _SyncJob) -> None:
+            _note_activity()
+            v = vault.verify(deep=True, progress=job.on_progress)
+            job.result = {"ok": len(v["ok"]), "missing": len(v["missing"]),
+                          "unreadable": len(v["unreadable"])}
+
+        job = _jobs.start("verify", work, writes=False)
+        return {"job_id": job.id, **job.snapshot()}
 
     @app.get("/api/archive/export")
     def api_archive_export():
@@ -560,10 +633,15 @@ def create_app(
         vault = _archive_mod.ArchiveStore(_vault_path)
         if not vault.exists():
             raise HTTPException(status_code=404, detail="no archive to export")
+        # Fold the write-ahead log into the manifest and skip SQLite's
+        # sidecars: they are only valid beside the exact database that wrote
+        # them, so shipping them would give the recipient a manifest that is
+        # either stale or unreadable.
+        vault.checkpoint()
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in vault.path.rglob("*"):
-                if p.is_file():
+            for p in sorted(vault.path.rglob("*")):
+                if p.is_file() and not vault._is_sidecar(p):
                     zf.write(p, arcname=str(p.relative_to(vault.path)))
         _note_activity()
         return Response(

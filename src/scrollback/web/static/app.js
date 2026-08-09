@@ -365,8 +365,10 @@ function enabledParam() {
 
 // Client-side drill-down from the archive landing (deleted-only, or a chosen
 // source). Cleared by clearArchiveDrill().
+// The "deleted" drill is applied SERVER-side (a `deleted=true` param), because
+// deleted sessions are interleaved by date with everything else and a
+// client-side filter on one 50-row page usually yields an empty list.
 function passesArchiveDrill(s) {
-  if (state.archiveFilterKind === "deleted") return !!s.archived_only;
   if (state.archiveFilterKind === "source") return s.source === state.archiveFilterSource;
   return true;
 }
@@ -521,6 +523,7 @@ async function loadSessions(reset) {
   state.list.kind = "sessions";
   const p = new URLSearchParams({ offset: String(state.list.offset), limit: String(PAGE), fold: "true" });
   p.set("mode", state.mode);
+  if (state.archiveFilterKind === "deleted") p.set("deleted", "true");
   if (state.query) p.set("q", state.query);
   if (state.since) p.set("since", state.since);
   if (state.until) p.set("until", state.until);
@@ -1082,22 +1085,49 @@ async function updateAllStale() {
 }
 
 // Fill an element with the integrity summary (ok / missing / unreadable).
+//
+// The landing does the SHALLOW check (every file present and non-empty), which
+// is near-instant. The deep check parses the whole vault -- tens of seconds on
+// a large archive -- so it is offered as an explicit action running as a
+// background job rather than blocking the page on every render.
 async function verifyInto(node) {
   let v;
   try { v = await getJSON("/api/archive/verify"); }
   catch { node.replaceChildren(el("span", {}, "integrity: unavailable")); return; }
   if (!v.exists) { node.replaceChildren(); return; }
+  renderIntegrity(node, v);
+}
+
+function renderIntegrity(node, v) {
   const bad = v.missing.length + v.unreadable.length;
+  const deepBtn = el("button", {
+    class: "integrity-deep",
+    title: "Parse every archived file to detect corruption (can take a while)",
+    onclick: () => runDeepVerify(node),
+  }, "run full check");
+
   if (!bad) {
     node.className = "archive-integrity ok";
-    node.replaceChildren(el("span", {}, `\u2713 integrity: all ${v.ok} files OK`));
+    node.replaceChildren(
+      el("span", {}, `\u2713 integrity: all ${v.ok} files present`),
+      v.deep ? null : deepBtn);
   } else {
     node.className = "archive-integrity bad";
-    node.replaceChildren(el("span", {},
-      `\u26a0 integrity: ${bad} problem${bad === 1 ? "" : "s"} `),
+    node.replaceChildren(
+      el("span", {}, `\u26a0 integrity: ${bad} problem${bad === 1 ? "" : "s"} `),
       helpIcon(`${v.missing.length} missing file(s), ${v.unreadable.length} unreadable. `
-        + "Run 'scrollback archive --verify' for the list."));
+        + "Run 'scrollback archive --verify' for the list."),
+      v.deep ? null : deepBtn);
   }
+}
+
+async function runDeepVerify(node) {
+  const r = await runSyncJob("/api/archive/verify", "Checking every archived file\u2026");
+  if (!r) return;
+  renderIntegrity(node, {
+    exists: true, deep: true, ok: r.ok,
+    missing: new Array(r.missing || 0), unreadable: new Array(r.unreadable || 0),
+  });
 }
 
 // ====================================================================

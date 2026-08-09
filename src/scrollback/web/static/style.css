@@ -388,6 +388,13 @@ button { font-family: inherit; }
 .archive-integrity { font-size: 12px; margin: 1rem 0; color: var(--fg-dim); }
 .archive-integrity.ok { color: var(--codex); }
 .archive-integrity.bad { color: var(--opencode); }
+/* opt-in deep scan: the landing only does the cheap presence check */
+.integrity-deep {
+  margin-left: .5rem; padding: .1rem .45rem; font: inherit; font-size: 11px;
+  color: var(--fg-dim); background: none; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 4px;
+}
+.integrity-deep:hover { color: var(--fg); border-color: var(--fg-dim); }
 
 /* action row + primary button + import */
 .archive-actions { display: flex; gap: .6rem; justify-content: center; flex-wrap: wrap; margin-top: 1.2rem; }

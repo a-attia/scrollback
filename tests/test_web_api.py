@@ -326,3 +326,46 @@ def test_no_vault_leaves_flags_false(tmp_path):
                               archive_path=tmp_path / "no-vault"))
     rows = c.get("/api/sessions").json()["sessions"]
     assert all(s["archived"] is False and s["archived_only"] is False for s in rows)
+
+
+# -- background-job registry -------------------------------------------------
+
+
+def test_job_registry_is_bounded():
+    """A long-lived server must not accumulate finished jobs forever."""
+    from scrollback.web.app import _JobRegistry
+
+    reg = _JobRegistry()
+    for i in range(reg._MAX_JOBS * 3):
+        reg.start(f"kind{i}", lambda job: None).finished.wait(2)
+    assert len(reg._jobs) <= reg._MAX_JOBS + 1
+
+
+def test_readonly_job_does_not_block_writers():
+    """Verification scans the whole vault; it must not hold the writer lock."""
+    import threading
+
+    from scrollback.web.app import _JobRegistry
+
+    reg = _JobRegistry()
+    release = threading.Event()
+    reg.start("verify", lambda job: release.wait(5), writes=False)
+
+    writer = reg.start("all", lambda job: None)
+    finished = writer.finished.wait(2)
+    release.set()
+    assert finished, "a writer was blocked behind a read-only job"
+
+
+def test_same_kind_jobs_are_coalesced():
+    import threading
+
+    from scrollback.web.app import _JobRegistry
+
+    reg = _JobRegistry()
+    release = threading.Event()
+    first = reg.start("all", lambda job: release.wait(5))
+    second = reg.start("all", lambda job: None)
+    assert second is first  # single-flight
+    release.set()
+    first.finished.wait(5)
