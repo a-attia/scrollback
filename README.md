@@ -14,13 +14,13 @@ modifies, locks for writing, or uploads your data.
 You can use it two ways. From the **command line**, list, search, and export
 your sessions in a single scriptable tool:
 
-![scrollback listing recent sessions in the terminal.](https://raw.githubusercontent.com/a-attia/scrollback/v0.5.0/assets/screenshots/cli.png)
+![scrollback listing recent sessions in the terminal.](https://raw.githubusercontent.com/a-attia/scrollback/v0.6.0/assets/screenshots/cli.png)
 
 Or open the **local web app** to read a transcript in full — with rendered
 Markdown, syntax-highlighted code, and typeset LaTeX math:
 
 ![The scrollback web app showing a session list beside a transcript with
-rendered Markdown, highlighted code, and typeset equations.](https://raw.githubusercontent.com/a-attia/scrollback/v0.5.0/assets/screenshots/web.png)
+rendered Markdown, highlighted code, and typeset equations.](https://raw.githubusercontent.com/a-attia/scrollback/v0.6.0/assets/screenshots/web.png)
 
 Both views read the same on-disk session stores, so you can jump between
 them freely. (The screenshots above use synthetic demo data.)
@@ -326,7 +326,7 @@ window; see [Running it as an app](#running-it-as-an-app)).
 
 ![The scrollback web app in Archive mode: a session list with live / archived /
 deleted provenance tags beside the archive dashboard (sessions kept, integrity
-check, per-source counts, and export / import / sync actions).](https://raw.githubusercontent.com/a-attia/scrollback/v0.5.0/assets/screenshots/archive.png)
+check, per-source counts, and export / import / sync actions).](https://raw.githubusercontent.com/a-attia/scrollback/v0.6.0/assets/screenshots/archive.png)
 
 What it offers:
 

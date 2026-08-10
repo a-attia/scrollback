@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-09
+
+Archive correctness and scale. Sessions that were permanently stuck on
+"needs updating" now settle after one sync, the "deleted from agent" count
+finally matches the list it links to, and the archive pages load in
+milliseconds instead of seconds on a multi-gigabyte vault.
+
+Found by auditing against a real 3.4 GB vault: two of these defects had
+shipped months earlier and were invisible to the test suite, because every
+test fake was too well-behaved to reproduce them. Each fix ships with a
+regression test verified to fail against the unfixed code.
+
+Upgrading is safe and needs no action: the manifest migrates in place on
+first use, and a 0.6.0 vault remains readable by 0.5.0 if you roll back.
+
 ### Fixed
 
 - **Archived sessions no longer stay stuck on "needs updating".** The vault's
@@ -364,7 +379,11 @@ export it from a CLI and a local web app.
 - Negative pagination arguments are rejected; clearer errors for unknown
   sources, failed exports, and unavailable data sources.
 
-[Unreleased]: https://github.com/a-attia/scrollback/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/a-attia/scrollback/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/a-attia/scrollback/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/a-attia/scrollback/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/a-attia/scrollback/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/a-attia/scrollback/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/a-attia/scrollback/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/a-attia/scrollback/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/a-attia/scrollback/compare/v0.2.0...v0.3.0

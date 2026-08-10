@@ -1,6 +1,6 @@
 # Plan-of-Record: scrollback
 
-**Library name**: `scrollback`. **Status**: 0.5.0 (alpha).
+**Library name**: `scrollback`. **Status**: 0.6.0 (alpha).
 **Repo**: <https://github.com/a-attia/scrollback>. **Licence**: MIT.
 **Audience**: developers who use AI coding agents and want their session
 history to be searchable, exportable, and permanent.
@@ -125,7 +125,7 @@ back it up and move it between machines. It is versioned by
 | M4 — FTS index | done | Optional SQLite FTS5 index with incremental sync |
 | M5 — durable archive, phases 1–4 | done (0.4.0) | Lossless vault, CLI, read-back as a source, web integration |
 | M6 — simpler install | done (0.5.0) | Web + native + rich are default deps; no extras to choose |
-| M7 — archive correctness + scale | done (unreleased) | Signature convergence, honest deleted-session reporting, O(index) request paths — see [CHANGELOG](CHANGELOG.md) |
+| M7 — archive correctness + scale | done (0.6.0) | Signature convergence, honest deleted-session reporting, O(index) request paths — see [CHANGELOG](CHANGELOG.md) |
 | M8 — vault search | planned | Index the vault so archived sessions are fast to search, not just browse |
 | M9 — auto-sync | planned | Opt-in background archiving, so keeping history needs no discipline |
 | M10 — more adapters | planned | Gemini CLI and Zed are Tier 1; see [`ROADMAP.md`](ROADMAP.md) |
